@@ -22,6 +22,7 @@ Dữ liệu ứng dụng được lưu dưới `data/`: file gốc ở `uploads/
 
 - Python + Streamlit cho demo local.
 - LangChain `RecursiveCharacterTextSplitter` và LangChain Chroma integration.
+- LangGraph `StateGraph` cho pipeline RAG bounded và workflow multi-agent theo supervisor/worker.
 - Gemini API `gemini-3.5-flash` cho sinh câu trả lời; `gemini-embedding-001` riêng cho vector văn bản.
 - Chroma lưu vector theo kho; SQLite lưu kho, file, chunk, hội thoại và tin nhắn.
 - Parser nhanh cho PDF có text, DOCX, XLSX, PPTX, TXT/Markdown, CSV/TSV và HTML. Nếu định dạng chưa có parser nhanh, PDF scan/ảnh hoặc trích xuất rỗng, ứng dụng tự chuyển sang Docling/OCR và nhận diện cấu trúc bảng.
@@ -119,5 +120,23 @@ Các design patterns có trong demo:
 - **Bounded corrective retrieval:** context grader đánh giá độ đủ, đề xuất một truy vấn sửa, retry tối đa một lần rồi abstain nếu vẫn yếu. Đây là evaluator-optimizer có giới hạn chi phí, lấy cảm hứng từ corrective RAG; không tuyên bố là triển khai đầy đủ paper CRAG hay Self-RAG.
 - **Observability spans:** provider instrumentation ghi lời gọi Gemini; span nghiệp vụ theo dõi retrieval, context, generation, audit và evaluation case.
 - **Dataset-driven evaluation:** câu hỏi, đáp án tham chiếu và nguồn kỳ vọng được lưu JSONL; baseline và advanced chạy trên cùng case.
+
+## Kịch bản sản phẩm, multi-agent và giọng nói
+
+Mở **🧭 Kịch bản sản phẩm** để chọn một quy trình theo mục tiêu thay vì phải hiểu cấu hình RAG. Tab quản lý cho phép tạo/sửa/xóa kịch bản gồm nhiều bước nhập liệu (`text`, `textarea`, `choice`, `documents`), bật/tắt kịch bản và chọn nhóm chuyên viên. Lượt chạy lưu snapshot phiên bản, câu trả lời, file được chọn, diagnostics, nguồn và chi phí trong SQLite; sửa kịch bản không làm thay đổi lịch sử lượt cũ. Có thể tạo nhanh kịch bản mẫu phân tích CV/đối chiếu yêu cầu tuyển dụng.
+
+Khi có bước chọn tài liệu, retrieval được giới hạn đúng vào file người dùng chọn; cả Chroma dense và BM25 đều nhận cùng phạm vi, rồi agent dùng một context chung. Nếu kịch bản không có bước tài liệu, luồng dùng toàn kho. Người dùng có thể nhập file ngay tại bước chọn tài liệu; file được parse, chia chunk và lập chỉ mục vào kho hiện tại.
+
+Luồng multi-agent trong LangGraph là `Supervisor → Specialists → Synthesis → Critic`. Supervisor chỉ có thể chọn agent trong danh sách cho phép; chuyên viên có vai trò rõ (trích xuất bằng chứng, bảng, đối chiếu nhiều tài liệu, đối chiếu yêu cầu, rủi ro/thiếu dữ liệu). Synthesis tạo câu trả lời và gợi ý; Critic kiểm tra lại với tài liệu gốc. Chạy tuần tự theo giới hạn RPM; retrieval và embedding chỉ chạy một lần dùng chung. Mặc định hai specialist và Critic tương đương tối đa năm generation call cộng một embedding batch; giảm agent hoặc tắt Critic để giảm token/độ trễ. Kịch bản không thực thi prompt code tùy ý.
+
+Trong **Kết nối AI & tùy chọn nâng cao → Chế độ trả lời**, có thể chọn **Multi-agent** để dùng workflow này trong chat thường. Câu hỏi về đếm/liệt kê file và câu hỏi tổng hợp toàn kho vẫn dùng nhánh inventory/map-reduce phù hợp. Mở diagnostics để xem route, báo cáo mỗi agent, critic, citation validation, request labels, token, nguồn và trang.
+
+**RAG Evaluation** có thể chạy RAG cơ bản, RAG nâng cao và Multi-agent trên cùng dataset. Có thể gán `expected_agents` (tùy chọn) trong JSONL để đo precision/recall/F1 định tuyến; metric này chỉ áp dụng cho Multi-agent. Khi chọn Multi-agent, một lượt bị giới hạn tối đa 3 case và giao diện tính chi phí tối đa trước khi chạy. Lịch sử run được lưu dưới `data/app.sqlite3`; JSON/CSV vẫn có thể tải để trình bày hoặc phân tích ngoài app.
+
+**Giọng nói:** trong chat, mở **Hỏi bằng giọng nói**, ghi âm và chuyển thành text bằng Gemini; người dùng được xem/sửa bản chép lời trước khi gửi. Lượt nhận dạng được cộng vào request/token diagnostics. Nút **Đọc câu trả lời** dùng Web Speech API của trình duyệt để phát tiếng Việt, không gọi TTS model và không tiêu thụ thêm quota Gemini; giọng đọc phụ thuộc voice tiếng Việt có sẵn trên máy/trình duyệt.
+
+**LangChain trong code hiện tại:** project dùng `Document`, `RecursiveCharacterTextSplitter` và `langchain-chroma`; wrapper Gemini nội bộ gọi API trực tiếp để kiểm soát batching, pacing, retry và meter. Không dùng một high-level LangChain retrieval chain hay LangChain agent tự do. LangGraph là lớp điều phối có state; các node agent là các vai trò Gemini riêng, có giới hạn số agent và node. Tab overview trong khu vực kịch bản giải thích từng lớp và pattern.
+
+Xem [docs/LANGCHAIN_AGENTIC_PATTERNS.md](docs/LANGCHAIN_AGENTIC_PATTERNS.md) để có sơ đồ, cost model và cách trình bày cho mentor.
 
 Xem [DEMO_GUIDE.md](DEMO_GUIDE.md) để có kịch bản trình bày và [docs/RAG_EVALUATION_OBSERVABILITY.md](docs/RAG_EVALUATION_OBSERVABILITY.md) để biết cách diễn giải metric, chi phí và giới hạn.

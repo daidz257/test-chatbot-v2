@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
 import time
@@ -8,6 +9,7 @@ import unicodedata
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from rag_demo.config import ROOT_DIR
@@ -48,6 +50,9 @@ from rag_demo.rag import (
 )
 from rag_demo.advanced_rag import run_advanced_pipeline
 from rag_demo.evaluation_ui import render_evaluation_workbench
+from rag_demo.multi_agent import run_multi_agent_pipeline
+from rag_demo.scenario_ui import render_scenario_workbench
+from rag_demo.voice import transcribe_audio
 
 load_dotenv(ROOT_DIR / ".env")
 st.set_page_config(page_title="Chat với kho tài liệu", page_icon="💬", layout="wide")
@@ -73,6 +78,41 @@ if not st.session_state.get("_incomplete_docs_recovered"):
 
 def _short_error(value: str | None) -> str:
     return (value or "").replace("\n", " ")[:650]
+
+
+def _render_speech_button(text: str, key: str) -> None:
+    safe_text = json.dumps(str(text), ensure_ascii=False).replace("</", "<\\/")
+    safe_key = re.sub(r"[^a-zA-Z0-9_-]", "", key)
+    components.html(
+        f"""<button id="speak-{safe_key}" style="border:1px solid #c9cdd3;border-radius:16px;
+        padding:5px 12px;background:#fff;cursor:pointer;font:13px sans-serif">🔊 Đọc câu trả lời</button>
+        <script>
+        const speakButton = document.getElementById("speak-{safe_key}");
+        speakButton.addEventListener("click", () => {{
+          if (!("speechSynthesis" in window)) {{
+            speakButton.textContent = "Trình duyệt không hỗ trợ đọc văn bản";
+            return;
+          }}
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance({safe_text});
+          utterance.lang = "vi-VN";
+          utterance.rate = 1;
+          window.speechSynthesis.speak(utterance);
+        }});
+        </script>""",
+        height=42,
+        scrolling=False,
+    )
+
+
+def _merge_request_meter(primary: dict, additional: dict) -> dict:
+    merged = dict(primary or {})
+    for key in ("api_calls", "embedding_calls", "generation_calls", "input_tokens", "output_tokens", "estimated_token_calls"):
+        merged[key] = int(merged.get(key, 0)) + int(additional.get(key, 0))
+    merged["total_tokens"] = int(merged.get("input_tokens", 0)) + int(merged.get("output_tokens", 0))
+    merged["labels"] = list(additional.get("labels", [])) + list(merged.get("labels", []))
+    merged["token_note"] = additional.get("token_note") or merged.get("token_note", "")
+    return merged
 
 
 def _location(page_number: int | None) -> str:
@@ -296,6 +336,9 @@ RRF chỉ dùng thứ hạng, không cộng trực tiếp cosine distance với 
 - **Parent-Child** tìm bằng child nhỏ rồi khôi phục parent lớn làm ngữ cảnh; nếu không tìm được parent, dùng nội dung child và ghi nhận fallback.
 - **Context compression** chọn đoạn/hàng liên quan cục bộ. **Answer Grading** đánh giá câu trả lời theo nguồn, **Citation Verification** kiểm tra mã trích dẫn và mức hỗ trợ. Hai kiểm tra dùng chung tối đa một generation request.
 - **LangGraph** giữ trạng thái và điều phối các node planner → retrieval → rerank/context → answer → audit trong chat thường. Lab thực hiện từng bước riêng để có thể xem và xác nhận từng đầu ra.
+- **Multi-agent** là một pipeline chọn riêng: LangGraph điều phối Supervisor → tối đa 3 specialist → Synthesis → Critic. Các agent có prompt/vai trò khác nhau nhưng dùng chung context retrieval; chạy tuần tự theo RPM và bị giới hạn số node. Tốn nhiều generation call hơn; mở **🧭 Kịch bản sản phẩm** để tạo luồng nhiều bước và xem báo cáo agent.
+- **Kịch bản sản phẩm** lưu các bước nhập text/lựa chọn/tài liệu, allowlist agent và phiên bản; khi có bước chọn file, retrieval chỉ dùng các file đó. Lịch sử chạy lưu input, snapshot, result, source và diagnostics.
+- **Giọng nói**: microphone chuyển sang text bằng một lượt Gemini, người dùng duyệt/sửa trước khi gửi. Nút loa dùng giọng tiếng Việt sẵn có trong trình duyệt, không gọi Gemini TTS.
 - Câu trả lời `[S1]`, `[S2]`… tham chiếu danh sách nguồn hiển thị bên dưới đáp án. Gợi ý câu hỏi tiếp theo là một phần của cùng câu trả lời Gemini, không phải request riêng.
 - **Thời gian** là thời lượng xử lý của lượt. **Lịch sử hội thoại** lưu user/assistant messages theo từng chat và kho; thao tác đổi/xóa nằm ở thanh lịch sử.
 
@@ -1303,6 +1346,11 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                     for name, enabled in techniques.items()
                 )
             )
+        if diagnostics.get("ignored_advanced_flags"):
+            st.caption(
+                "Không áp dụng trong Multi-agent: "
+                + ", ".join(diagnostics["ignored_advanced_flags"])
+            )
         plan = diagnostics.get("plan", {})
         if plan:
             st.markdown("**Lập kế hoạch truy vấn**")
@@ -1450,6 +1498,33 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                             + llm_audit.get("citation_issues", [])
                         )
                     )
+        supervisor = diagnostics.get("supervisor", {})
+        if supervisor:
+            st.markdown("**Điều phối multi-agent**")
+            st.caption(
+                f"Supervisor chọn: {', '.join(supervisor.get('selected_agents', [])) or 'không có agent'} · "
+                f"{supervisor.get('reason', '')}"
+            )
+            for agent in diagnostics.get("agents", []):
+                with st.expander(agent.get("agent_name", agent.get("agent_id", "Specialist")), expanded=False):
+                    st.write("Phát hiện:", agent.get("findings", []))
+                    st.write("Chưa đủ dữ kiện:", agent.get("unknowns", []))
+            critic = diagnostics.get("critic", {})
+            if critic.get("enabled"):
+                st.write("Critic:", "Đã kiểm tra" if critic.get("supported") else "Có điểm cần thận trọng")
+                if critic.get("issues"):
+                    st.warning(" · ".join(critic["issues"]))
+            citation_check = diagnostics.get("citation_validation", {})
+            if citation_check:
+                st.write("Citation ID:", "Hợp lệ" if citation_check.get("passed") else "Có mã cần kiểm tra")
+                if citation_check.get("invalid_refs"):
+                    st.error(f"Citation không thuộc nguồn lượt này: {citation_check['invalid_refs']}")
+            st.caption(
+                f"Context được lặp qua specialist/synthesis/critic: "
+                f"~{diagnostics.get('estimated_repeated_context_tokens', 0):,} token tổng hợp."
+            )
+        if diagnostics.get("voice_transcription_meter"):
+            st.caption("Lượt gọi nhận dạng giọng nói đã được cộng vào tổng request/token ở trên.")
 
 
 def _render_comparison(comparison: dict, message_key: str) -> None:
@@ -1698,6 +1773,23 @@ def _queue_typed_query() -> None:
         _queue_follow_up(query, kb_id, conversation_id)
 
 
+def _queue_voice_query(kb_id: str, conversation_id: str) -> None:
+    query = str(st.session_state.get("voice-transcribed-text", "")).strip()
+    if not query:
+        return
+    st.session_state["pending_query_request"] = {
+        "query": query,
+        "kb_id": st.session_state.get("voice-transcribed-kb", kb_id),
+        "conversation_id": conversation_id,
+        "voice_meter": st.session_state.get("voice-transcribed-meter", {}),
+    }
+    # Callbacks run before widgets are rendered again, so it is safe to reset
+    # the transcript field here while preserving its conversation destination.
+    st.session_state["voice-transcribed-text"] = ""
+    for key in ("voice-transcribed-meter", "voice-transcribed-kb", "voice-transcribed-conversation"):
+        st.session_state.pop(key, None)
+
+
 def _create_kb_callback() -> None:
     name = st.session_state.get("new-kb-name", "").strip()
     if name:
@@ -1748,7 +1840,7 @@ def _apply_rag_preset(preset: str) -> None:
 
 app_surface = st.radio(
     "Khu vực làm việc",
-    ["💬 Chat", "🧪 Phòng thử nghiệm từng bước", "📊 RAG Evaluation"],
+    ["💬 Chat", "🧭 Kịch bản sản phẩm", "🧪 Phòng thử nghiệm từng bước", "📊 RAG Evaluation"],
     horizontal=True,
     key="app-surface",
 )
@@ -1894,11 +1986,33 @@ with st.sidebar:
             st.warning("Cần API key Gemini để nhập tài liệu và hỏi đáp.")
         answer_mode = st.selectbox(
             "Chế độ trả lời",
-            ["Cơ bản", "Nâng cao", "So sánh cơ bản và nâng cao"],
+            ["Cơ bản", "Nâng cao", "Multi-agent", "So sánh cơ bản và nâng cao"],
             index=1,
             key="answer-pipeline-mode-v2",
-            help="So sánh chạy cả hai pipeline cho cùng câu hỏi nên sẽ dùng token của cả hai lượt.",
+            help="Multi-agent có Supervisor, specialist, synthesis và Critic; tốn nhiều lượt Gemini hơn RAG đơn. So sánh chạy hai pipeline cùng câu hỏi.",
         )
+        agent_max_workers = 2
+        agent_include_critic = True
+        if answer_mode == "Multi-agent":
+            with st.expander("Tùy chọn nhóm AI", expanded=False):
+                agent_max_workers = st.number_input(
+                    "Số chuyên viên tối đa", min_value=1, max_value=3, value=2, step=1,
+                    key="chat-agent-max-workers",
+                )
+                agent_include_critic = st.checkbox(
+                    "Bật Critic / kiểm tra citation (thêm 1 generation call)",
+                    value=True,
+                    key="chat-agent-critic",
+                )
+                st.caption(
+                    f"Ước tính lượt này: 1 embedding batch + tối đa "
+                    f"{1 + int(agent_max_workers) + 1 + int(agent_include_critic)} generation calls. "
+                    "Giảm số specialist hoặc tắt Critic để tiết kiệm token."
+                )
+                st.caption(
+                    "Multi-agent dùng Parent-Child, Hybrid/BM25, reranker và nén context theo các công tắc tương ứng. "
+                    "Query Rewrite, HyDE, Corrective Retrieval và Answer Grading không chạy trong pipeline này."
+                )
         chat_mode = st.selectbox(
             "Phạm vi tìm kiếm",
             ["Tự động", "Hỏi đáp chi tiết", "Tổng hợp toàn kho"],
@@ -2089,6 +2203,19 @@ if app_surface == "🧪 Phòng thử nghiệm từng bước":
     )
     st.stop()
 
+if app_surface == "🧭 Kịch bản sản phẩm":
+    render_scenario_workbench(
+        kb_id=kb_id,
+        kb_name=kb_display_names.get(kb_id, "Kho tài liệu"),
+        api_key=api_key,
+        embedding_rpm=int(embedding_rpm),
+        generation_rpm=int(generation_rpm),
+        top_k=int(top_k),
+        candidate_k=int(candidate_k) if "candidate_k" in locals() else 24,
+        context_token_budget=int(context_token_budget) if "context_token_budget" in locals() else 4000,
+    )
+    st.stop()
+
 if app_surface == "📊 RAG Evaluation":
     render_evaluation_workbench(
         root_dir=ROOT_DIR,
@@ -2104,6 +2231,7 @@ if app_surface == "📊 RAG Evaluation":
         use_langgraph=bool(use_langgraph) if "use_langgraph" in locals() else True,
         basic_runner=_run_basic_answer,
         advanced_runner=run_advanced_pipeline,
+        multi_agent_runner=run_multi_agent_pipeline,
     )
     st.stop()
 
@@ -2191,6 +2319,9 @@ for message_index, message in enumerate(messages):
     with st.chat_message(role):
         st.markdown(message["content"])
         if role == "assistant":
+            speech_text = re.sub(r"\[S\d+\]", "", str(message["content"]))
+            speech_text = re.sub(r"[#*_`~]", "", speech_text).strip()
+            _render_speech_button(speech_text, str(message.get("id", message_index)))
             saved_steps = message.get("diagnostics", {}).get("progress_steps", [])
             if saved_steps:
                 st.caption(f"✓ {saved_steps[-1]}")
@@ -2226,6 +2357,54 @@ for message_index, message in enumerate(messages):
                         args=(previous_user["content"], kb_id, conversation_id),
                     )
 
+with st.expander("🎙️ Hỏi bằng giọng nói", expanded=False):
+    st.caption("Ghi âm tiếng Việt, xem lại bản chép lời, rồi xác nhận để gửi câu hỏi.")
+    audio_recording = st.audio_input(
+        "Ghi âm câu hỏi", sample_rate=16000,
+        key=f"chat-audio-input-{kb_id}-{conversation_id}",
+    )
+    if st.button(
+        "Chuyển giọng nói thành văn bản",
+        key=f"transcribe-audio-{kb_id}-{conversation_id}",
+        disabled=not audio_recording or not api_key,
+    ):
+        voice_meter = RequestMeter()
+        try:
+            with st.spinner("Gemini đang nhận dạng lời nói…"):
+                transcript = transcribe_audio(
+                    api_key,
+                    audio_recording.getvalue(),
+                    getattr(audio_recording, "type", "audio/wav") or "audio/wav",
+                    rpm_limit=int(generation_rpm),
+                    meter=voice_meter,
+                )["text"]
+            st.session_state["voice-transcribed-text"] = transcript
+            voice_meter_data = voice_meter.as_dict()
+            if voice_meter_data.get("estimated_token_calls"):
+                voice_meter_data["token_note"] = (
+                    str(voice_meter_data.get("token_note", ""))
+                    + " Ước tính từ độ dài prompt không tính chính xác token của waveform audio."
+                )
+            st.session_state["voice-transcribed-meter"] = voice_meter_data
+            st.session_state["voice-transcribed-kb"] = kb_id
+            st.session_state["voice-transcribed-conversation"] = conversation_id
+        except (GeminiRequestError, ValueError, RuntimeError) as error:
+            st.error(str(error))
+    if st.session_state.get("voice-transcribed-conversation") == conversation_id:
+        st.text_area(
+            "Bản chép lời (có thể sửa trước khi gửi)",
+            key="voice-transcribed-text",
+            height=80,
+        )
+        st.button(
+            "Dùng câu hỏi này trong cuộc hội thoại",
+            key=f"send-transcript-{conversation_id}",
+            type="primary",
+            disabled=not str(st.session_state.get("voice-transcribed-text", "")).strip(),
+            on_click=_queue_voice_query,
+            args=(kb_id, conversation_id),
+        )
+
 pending_request = st.session_state.pop("pending_query_request", None)
 typed_query = st.chat_input(
     "Hỏi về nội dung trong kho tài liệu…",
@@ -2235,6 +2414,7 @@ typed_query = st.chat_input(
 query = pending_request["query"] if pending_request else typed_query
 target_kb_id = pending_request["kb_id"] if pending_request else kb_id
 target_conversation_id = pending_request["conversation_id"] if pending_request else conversation_id
+voice_meter_data = pending_request.get("voice_meter", {}) if pending_request else {}
 if query:
     inventory_query = is_document_count_question(query)
     inventory_list_query = is_document_list_question(query)
@@ -2283,6 +2463,22 @@ if query:
                     generation_rpm=int(generation_rpm),
                     progress=progress,
                 )
+            elif answer_mode == "Multi-agent":
+                result = run_multi_agent_pipeline(
+                    target_kb_id,
+                    api_key,
+                    query,
+                    history,
+                    flags=feature_flags,
+                    top_k=int(top_k),
+                    candidate_k=int(candidate_k),
+                    context_token_budget=int(context_token_budget),
+                    embedding_rpm=int(embedding_rpm),
+                    generation_rpm=int(generation_rpm),
+                    max_agents=int(agent_max_workers),
+                    include_critic=bool(agent_include_critic),
+                    progress=progress,
+                )
             else:
                 advanced_result = run_advanced_pipeline(
                     target_kb_id,
@@ -2329,6 +2525,11 @@ if query:
             if comparison_data:
                 progress("Đã chạy xong hai pipeline để so sánh kết quả.")
             diagnostics = result.setdefault("diagnostics", {})
+            if voice_meter_data:
+                diagnostics["voice_transcription_meter"] = voice_meter_data
+                diagnostics["request_meter"] = _merge_request_meter(
+                    diagnostics.get("request_meter", {}), voice_meter_data
+                )
             diagnostics["progress_steps"] = list(progress_steps)
             db.save_message(
                 target_conversation_id,
@@ -2344,14 +2545,18 @@ if query:
         except (GeminiRequestError, ValueError, RuntimeError) as error:
             message = str(error)
             progress_steps.append("Lượt xử lý dừng do lỗi; xem nội dung lỗi bên dưới câu trả lời.")
+            error_diagnostics = {
+                "pipeline": "Multi-agent" if answer_mode == "Multi-agent" else "Nâng cao" if answer_mode != "Cơ bản" else "RAG cơ bản",
+                "progress_steps": progress_steps[-100:],
+            }
+            if voice_meter_data:
+                error_diagnostics["voice_transcription_meter"] = voice_meter_data
+                error_diagnostics["request_meter"] = _merge_request_meter({}, voice_meter_data)
             db.save_message(
                 target_conversation_id,
                 "assistant",
                 f"Mình chưa hoàn tất được yêu cầu này.\n\n{message}",
-                diagnostics={
-                    "pipeline": "Nâng cao" if answer_mode != "Cơ bản" else "RAG cơ bản",
-                    "progress_steps": progress_steps[-100:],
-                },
+                diagnostics=error_diagnostics,
             )
             status_box.error(message)
         st.rerun()

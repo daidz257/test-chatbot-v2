@@ -246,9 +246,10 @@ def _rank_candidates(
     embedding_rpm: int,
     candidate_k: int,
     top_k: int,
+    document_ids: list[str] | None = None,
     progress=None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    all_rows = db.get_all_ready_chunks(kb_id)
+    all_rows = db.get_ready_chunks_for_documents(kb_id, document_ids)
     if not all_rows:
         raise ValueError("Kho này chưa có tài liệu đã nhập thành công.")
     row_by_id = {row["id"]: row for row in all_rows}
@@ -272,16 +273,26 @@ def _rank_candidates(
     if store._collection.count() == 0:
         raise ValueError("Kho này chưa có vector. Hãy lập chỉ mục tài liệu trước khi hỏi.")
 
-    dense_k = min(max(candidate_k, 8), 50)
+    dense_k = min(max(candidate_k, 8), 50, len(row_by_id))
+    where_filter = None
+    if document_ids is not None:
+        where_filter = (
+            {"document_id": document_ids[0]}
+            if len(document_ids) == 1
+            else {"document_id": {"$in": document_ids}}
+        )
     reciprocal_scores: dict[str, float] = {}
     dense_seen: set[str] = set()
     dense_rankings: list[list[str]] = []
     for variant, vector in zip(query_variants, query_vectors):
-        raw = store._collection.query(
-            query_embeddings=[vector],
-            n_results=min(dense_k, store._collection.count()),
-            include=["metadatas", "distances"],
-        )
+        query_args = {
+            "query_embeddings": [vector],
+            "n_results": min(dense_k, len(row_by_id)),
+            "include": ["metadatas", "distances"],
+        }
+        if where_filter:
+            query_args["where"] = where_filter
+        raw = store._collection.query(**query_args)
         ids = (raw.get("ids") or [[]])[0]
         ranking = [chunk_id for chunk_id in ids if chunk_id in row_by_id]
         dense_rankings.append(ranking)
@@ -294,7 +305,10 @@ def _rank_candidates(
     bm25_seen: set[str] = set()
     bm25_rankings: list[list[str]] = []
     if flags.get("hybrid_search"):
-        cached = _bm25_index(kb_id)
+        if document_ids is None:
+            cached = _bm25_index(kb_id)
+        else:
+            cached = (all_rows, BM25Okapi([_terms(row["content"]) for row in all_rows])) if all_rows else None
         if cached:
             rows, bm25 = cached
             indexed_ids = [row["id"] for row in rows]
@@ -784,6 +798,39 @@ def _build_context(
         "compression_enabled": bool(flags.get("context_compression")),
         "dense_anchor_sources": sum(bool(source.get("is_dense_anchor")) for source in sources),
         "selected_context_labels": selected_context_labels,
+    }
+
+
+def retrieve_context_for_agents(
+    kb_id: str,
+    api_key: str,
+    question: str,
+    history: list[dict[str, str]],
+    *,
+    flags: dict[str, bool],
+    meter: RequestMeter,
+    top_k: int = 6,
+    candidate_k: int = 24,
+    context_token_budget: int = 4000,
+    embedding_rpm: int = EMBEDDING_RPM_LIMIT,
+    document_ids: list[str] | None = None,
+    progress=None,
+) -> dict[str, Any]:
+    """Retrieve one bounded evidence context for a specialist-agent workflow."""
+    plan = {"rewritten_query": question, "alternative_queries": [], "hypothetical_answer": ""}
+    candidates, retrieval = _rank_candidates(
+        kb_id, api_key, question, history, plan, flags, meter,
+        embedding_rpm=embedding_rpm, candidate_k=candidate_k, top_k=top_k,
+        document_ids=document_ids, progress=progress,
+    )
+    context, sources, context_diagnostics = _build_context(
+        question, candidates, flags, top_k=top_k, context_token_budget=context_token_budget
+    )
+    return {
+        "context": context,
+        "sources": sources,
+        "retrieval": retrieval,
+        "context_diagnostics": context_diagnostics,
     }
 
 

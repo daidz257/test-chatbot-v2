@@ -108,13 +108,27 @@ Chạy thử cùng một bộ câu hỏi ngắn trước buổi demo: một dữ
 | Metadata/lịch sử | SQLite | Kho, file, chunk, hội thoại và trích dẫn |
 | Hybrid/Rerank | BM25 + FlashRank | Hợp nhất từ khóa/vector và xếp lại candidate local |
 | Workflow | LangGraph StateGraph | Điều phối planner → retrieval → compression → answer → audit |
-| Evaluation | Bộ JSONL + phép đo nguồn/citation/abstention | So sánh baseline và advanced, lưu kết quả CSV/JSON; LLM Judge là tùy chọn |
-| Observability | Phoenix + OpenInference + OpenTelemetry | Xem trace provider và span theo bước; mặc định tắt, chạy local |
+| Agentic workflow | LangGraph multi-agent | Supervisor chọn specialist, Synthesis tạo đầu ra, Critic kiểm tra nguồn |
+| Kịch bản sản phẩm | SQLite + Streamlit wizard | Kịch bản nhiều bước, file đầu vào, phiên bản và lịch sử kết quả |
+| Voice | Streamlit audio input + Gemini transcription + browser SpeechSynthesis | Nói thành câu hỏi, nghe câu trả lời mà không tạo TTS API call |
+| Evaluation | Bộ JSONL + phép đo nguồn/citation/abstention/routing | So sánh baseline, advanced và multi-agent; lưu lịch sử run và tải CSV/JSON; LLM Judge là tùy chọn |
+| Observability | Phoenix + OpenInference + OpenTelemetry | Xem provider spans, retrieval/context và từng agent; mặc định tắt, chạy local |
 
 ## Demo task mới: evaluation, trace và agentic loop
 
-Chọn **📊 RAG Evaluation**, dùng kho có tài liệu khớp expected sources, chọn 3–6 case rồi chạy cả RAG cơ bản và nâng cao. Dùng bộ demo 12 câu hỏi hoặc tải JSONL riêng. Chỉ ra một case baseline bỏ sót nguồn, sau đó đối chiếu source recall, câu trả lời, latency và tokens của advanced. Mở một case để xem nguồn file/trang/chunk và reference answer. Bật LLM Judge cho tối đa một case để trình bày cách model chấm correctness/groundedness/relevance; nhấn mạnh điểm judge có thể sai và cần kiểm tra thủ công.
+Chọn **📊 RAG Evaluation**, dùng kho có tài liệu khớp expected sources, chọn 3–6 case để chạy RAG cơ bản/nâng cao. Nếu thêm Multi-agent RAG, app giới hạn tối đa 3 case và hiển thị chi phí dự kiến. Dùng bộ demo 12 câu hỏi hoặc tải JSONL riêng. Đối chiếu source recall, câu trả lời, latency và tokens của cả ba pipeline; mở case để xem nguồn file/trang/chunk, route, từng specialist và reference answer. Bật LLM Judge cho ít case để trình bày correctness/groundedness/relevance; nhấn mạnh điểm judge có thể sai và cần kiểm tra thủ công.
 
 Để demo Corrective Retrieval, bật **Tự đánh giá nguồn và tìm lại tối đa 1 lần**, hỏi case khó rồi mở **Xem pipeline, nguồn và chi phí**. Giải thích rằng app chấm mức đủ của context trước bước sinh, có thể tìm lại một lần và dừng nếu bằng chứng vẫn thiếu. Đây là vòng corrective retrieval có giới hạn, không phải agent tự do hay triển khai đầy đủ paper CRAG/Self-RAG.
 
 Để demo trace, cài dependency riêng bằng `.\.venv\Scripts\python.exe -m pip install -r .\requirements-observability.txt`, đặt `PHOENIX_TRACING_ENABLED=true` trong `.env`, chạy `run-phoenix.ps1` ở terminal thứ nhất rồi khởi động Streamlit ở terminal thứ hai. Mở `http://localhost:6006` sau khi gửi một câu hỏi. Phoenix giúp xem provider span và node nào tốn thời gian; request Gemini vẫn đi qua API Google.
+
+## Demo mentor: Agentic Design Patterns và kịch bản sản phẩm
+
+1. Trong **📊 RAG Evaluation**, chọn cùng case và so ba pipeline Basic, Advanced, Multi-agent. Giữ khoảng 2–3 case khi bật Multi-agent để tránh tiêu thụ quota lớn.
+2. Mở một case multi-agent, xem Supervisor chọn agent nào, từng specialist nêu gì, Synthesis và Critic kiểm tra câu trả lời ra sao. Chỉ ra input/token và latency tăng do nhiều agent cùng đọc một context.
+3. Trong JSONL thêm `expected_agents` cho case. Chạy lại để thấy routing precision/recall/F1; giải thích đây là nhãn của người tạo dataset, không phải điểm đúng-sai nội dung.
+4. Vào **🧭 Kịch bản sản phẩm**, tạo bản sao mẫu CV hoặc tạo scenario khác. Đi lần lượt các trường; bước `documents` upload/chọn file rồi giới hạn retrieval đúng phạm vi file đó.
+5. Mở phần chi tiết để xem trace, nguồn, trang, chunk, token và route; xem lịch sử chạy lưu scenario version cùng kết quả.
+6. Trở lại chat, mở **Hỏi bằng giọng nói**, ghi âm, sửa bản chép lời rồi gửi. Dùng nút loa để phát đáp án qua voice tiếng Việt của trình duyệt.
+
+Giải thích ranh giới công nghệ: LangChain cung cấp Document/splitter/Chroma integration; LangGraph điều phối state/graph; agent là các vai trò Gemini riêng trong graph bounded. Specialist chạy tuần tự để kiểm soát RPM; hiện tại không phải agent song song hay agent tự do dùng tool.

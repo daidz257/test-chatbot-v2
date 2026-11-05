@@ -12,6 +12,7 @@ import streamlit as st
 
 from . import db
 from .evaluation import (
+    agent_selection_metrics,
     aggregate_results,
     case_metrics,
     judge_answer,
@@ -37,11 +38,12 @@ def render_evaluation_workbench(
     use_langgraph: bool,
     basic_runner: Callable[..., dict[str, Any]],
     advanced_runner: Callable[..., dict[str, Any]],
+    multi_agent_runner: Callable[..., dict[str, Any]],
 ) -> None:
     st.title("📊 RAG Evaluation & Observability")
     st.caption(
-        "Chạy cùng một bộ câu hỏi qua RAG cơ bản và nâng cao, đo retrieval, citations, abstention, "
-        "độ trễ và quota. Đây là benchmark nhỏ để demo, không thay thế tập đánh giá đại diện."
+        "Chạy cùng một bộ câu hỏi qua RAG cơ bản, nâng cao và multi-agent; đo retrieval, citations, "
+        "abstention, định tuyến agent, độ trễ và quota. Đây là benchmark nhỏ để demo, không thay thế tập đánh giá đại diện."
     )
     st.info(
         "Mỗi lần chạy gọi Gemini cho từng câu hỏi được chọn. LLM Judge thêm một lượt Gemini cho mỗi kết quả; "
@@ -55,12 +57,14 @@ def render_evaluation_workbench(
         '"expected_sources":["ten-file.pdf"],"answerable":true,"category":"fact lookup"}\n'
         '{"id":"case-2","question":"Thông tin không có trong tài liệu là gì?",'
         '"reference_answer":"Chưa đủ căn cứ để trả lời.","expected_sources":["ten-file.pdf"],'
-        '"answerable":false,"category":"abstention"}\n'
+        '"answerable":false,"category":"abstention","expected_agents":["risk_analyst"]}\n'
     )
     with st.expander("Dataset: schema và tải mẫu", expanded=False):
         st.markdown(
             "Mỗi dòng JSONL có `id`, `question`, `reference_answer`, `expected_sources` (tên file) và "
-            "`answerable` (true/false); `category` là tùy chọn. Nên có câu trả lời được/không được, "
+            "`answerable` (true/false); `category` và `expected_agents` là tùy chọn. Agent ID hợp lệ: "
+            "`evidence_analyst`, `table_analyst`, `cross_document_analyst`, `requirements_analyst`, `risk_analyst`. "
+            "Nên có câu trả lời được/không được, "
             "câu hỏi số liệu/bảng và câu cần nhiều file."
         )
         st.download_button("Tải JSONL template", template, "rag_eval_template.jsonl", "application/jsonl")
@@ -102,19 +106,42 @@ def render_evaluation_workbench(
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         pipelines = st.multiselect(
-            "Pipeline", ["RAG cơ bản", "RAG nâng cao"],
+            "Pipeline", ["RAG cơ bản", "RAG nâng cao", "Multi-agent RAG"],
             default=["RAG cơ bản", "RAG nâng cao"], key="rag-eval-pipelines",
         )
     with col_b:
+        case_cap = min(3, len(cases)) if "Multi-agent RAG" in pipelines else len(cases)
         limit = st.number_input(
-            "Số case tối đa", min_value=1, max_value=len(cases),
-            value=min(6, len(cases)), step=1, key="rag-eval-case-limit",
+            "Số case tối đa", min_value=1, max_value=case_cap,
+            value=min(3 if "Multi-agent RAG" in pipelines else 6, case_cap), step=1,
+            key=f"rag-eval-case-limit-{int('Multi-agent RAG' in pipelines)}",
+            help="Khi có Multi-agent RAG, tối đa 3 case mỗi lượt để giới hạn quota và thời gian.",
         )
     with col_c:
         use_judge = st.checkbox(
             "Bật LLM Judge", value=False, key="rag-eval-judge",
             help="Thêm một generation call cho mỗi kết quả.",
         )
+    multi_agent_max_agents = 2
+    multi_agent_critic = True
+    if "Multi-agent RAG" in pipelines:
+        with st.expander("⚙️ Chi phí Multi-agent", expanded=True):
+            ma_a, ma_b = st.columns(2)
+            with ma_a:
+                multi_agent_max_agents = st.number_input(
+                    "Số specialist tối đa", min_value=1, max_value=3, value=2, step=1,
+                    key="rag-eval-ma-agents",
+                )
+            with ma_b:
+                multi_agent_critic = st.checkbox(
+                    "Bật Critic (thêm 1 generation call)", value=True,
+                    key="rag-eval-ma-critic",
+                )
+            st.caption(
+                f"Mỗi case multi-agent: 1 embedding batch + tối đa "
+                f"{1 + int(multi_agent_max_agents) + 1 + int(multi_agent_critic)} generation calls. "
+                "Worker chạy tuần tự theo giới hạn RPM."
+            )
     selected = cases[: int(limit)]
     has_planner = any(feature_flags.get(name) for name in ("query_rewrite", "multi_query", "hyde"))
     has_audit = bool(feature_flags.get("answer_grading") or feature_flags.get("citation_verification"))
@@ -130,6 +157,10 @@ def render_evaluation_workbench(
     if "RAG nâng cao" in pipelines:
         generation_estimate += len(selected) * (advanced_generations_max + int(use_judge))
         embedding_estimate += len(selected) * (1 + int(feature_flags.get("corrective_retrieval", False)))
+    if "Multi-agent RAG" in pipelines:
+        multi_agent_generation_max = 1 + int(multi_agent_max_agents) + 1 + int(multi_agent_critic)
+        generation_estimate += len(selected) * (multi_agent_generation_max + int(use_judge))
+        embedding_estimate += len(selected)
     st.caption(
         f"Ước tính tối đa: khoảng {generation_estimate} generation call, {embedding_estimate} embedding batch; "
         "không tính retry do lỗi mạng/quota."
@@ -137,7 +168,7 @@ def render_evaluation_workbench(
     run_signature = hashlib.sha256(
         json.dumps(
             {
-                "metrics_version": 2,
+                "metrics_version": 3,
                 "kb_id": kb_id,
                 "dataset": payload,
                 "corpus": [
@@ -159,6 +190,8 @@ def render_evaluation_workbench(
                 "embedding_rpm": embedding_rpm,
                 "generation_rpm": generation_rpm,
                 "use_langgraph": use_langgraph,
+                "multi_agent_max_agents": int(multi_agent_max_agents),
+                "multi_agent_critic": multi_agent_critic,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -190,13 +223,23 @@ def render_evaluation_workbench(
                             embedding_rpm=embedding_rpm, generation_rpm=generation_rpm,
                             progress=case_progress,
                         )
-                    else:
+                    elif pipeline == "RAG nâng cao":
                         result = advanced_runner(
                             kb_id, api_key, case["question"], [], flags=feature_flags,
                             top_k=top_k, candidate_k=candidate_k,
                             context_token_budget=context_token_budget,
                             embedding_rpm=embedding_rpm, generation_rpm=generation_rpm,
                             use_langgraph=use_langgraph, progress=case_progress,
+                        )
+                    else:
+                        result = multi_agent_runner(
+                            kb_id, api_key, case["question"], [], flags=feature_flags,
+                            top_k=top_k, candidate_k=candidate_k,
+                            context_token_budget=context_token_budget,
+                            embedding_rpm=embedding_rpm, generation_rpm=generation_rpm,
+                            max_agents=int(multi_agent_max_agents),
+                            include_critic=multi_agent_critic,
+                            progress=case_progress,
                         )
                 error_text = ""
             except Exception as error:
@@ -212,6 +255,12 @@ def render_evaluation_workbench(
             answer = str(result.get("answer", ""))
             sources = result.get("sources", [])
             metrics = case_metrics(case, answer, sources)
+            route = result.get("diagnostics", {}).get("supervisor", {})
+            metrics.update(
+                agent_selection_metrics(case, route.get("selected_agents", []))
+                if pipeline == "Multi-agent RAG"
+                else {"agent_selection_precision": None, "agent_selection_recall": None, "agent_selection_f1": None}
+            )
             chunk_contents = db.get_chunk_contents(
                 [str(source.get("chunk_id", "")) for source in sources if source.get("chunk_id")]
             )
@@ -248,6 +297,35 @@ def render_evaluation_workbench(
             progress_bar.progress(index / max(1, total))
         st.session_state["rag-eval-last-run"] = rows
         st.session_state["rag-eval-run-signature"] = run_signature
+        try:
+            db.save_evaluation_run(
+                knowledge_base_id=kb_id,
+                dataset_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                config={
+                    "pipelines": pipelines,
+                    "case_limit": int(limit),
+                    "judge": use_judge,
+                    "feature_flags": feature_flags,
+                    "top_k": top_k,
+                    "candidate_k": candidate_k,
+                    "context_token_budget": context_token_budget,
+                    "multi_agent_max_agents": int(multi_agent_max_agents),
+                    "multi_agent_critic": multi_agent_critic,
+                },
+                summary=aggregate_results(rows),
+                results=[
+                    {
+                        "pipeline": row["pipeline"], "case": row["case"],
+                        "answer": row["answer"], "sources": row["sources"],
+                        "diagnostics": row["diagnostics"], "metrics": row["metrics"],
+                        "judge": row["judge"], "judge_meter": row["judge_meter"],
+                        "judge_latency_ms": row["judge_latency_ms"], "error": row["error"],
+                    }
+                    for row in rows
+                ],
+            )
+        except Exception as error:
+            st.warning(f"Không lưu được lịch sử evaluation: {str(error)[:250]}")
         status.success("Evaluation hoàn tất. Xem từng case hoặc tải kết quả bên dưới.")
 
     rows = st.session_state.get("rag-eval-last-run", [])
@@ -275,11 +353,15 @@ def render_evaluation_workbench(
                 "answer": row.get("answer"),
                 "expected_answerable": row["case"].get("answerable"),
                 "expected_sources": row["case"].get("expected_sources"),
+                "expected_agents": row["case"].get("expected_agents", []),
                 "sources": [
                     {key: source.get(key) for key in ("ref", "file_name", "page_number", "chunk_index", "chunk_id")}
                     for source in row.get("sources", [])
                 ],
                 "metrics": row.get("metrics"), "judge": row.get("judge"),
+                "supervisor": diagnostics.get("supervisor", {}),
+                "agent_trace": diagnostics.get("agents", []),
+                "critic": diagnostics.get("critic", {}),
                 "latency_ms": diagnostics.get("latency_ms"),
                 "judge_latency_ms": row.get("judge_latency_ms", 0),
                 "request_meter": diagnostics.get("request_meter", {}),
@@ -295,6 +377,7 @@ def render_evaluation_workbench(
         "pipeline", "case_id", "category", "question", "answer", "retrieval_hit",
         "expected_source_recall", "retrieved_document_precision", "abstention_correct",
         "citation_refs_valid", "citation_present", "citation_check_passed", "retrieved_files",
+        "agent_selection_precision", "agent_selection_recall", "agent_selection_f1",
         "latency_ms", "api_calls", "input_tokens",
         "output_tokens", "judge_latency_ms", "judge_correctness", "judge_groundedness",
         "judge_answer_relevance", "error",
@@ -311,7 +394,8 @@ def render_evaluation_workbench(
                 **{key: metrics.get(key) for key in (
                     "retrieval_hit", "expected_source_recall", "retrieved_document_precision",
                     "abstention_correct", "citation_refs_valid", "citation_present",
-                    "citation_check_passed", "retrieved_files",
+                    "citation_check_passed", "retrieved_files", "agent_selection_precision",
+                    "agent_selection_recall", "agent_selection_f1",
                 )},
                 "latency_ms": row["latency_ms"],
                 "judge_latency_ms": row.get("judge_latency_ms", 0),
@@ -326,6 +410,37 @@ def render_evaluation_workbench(
         "Tải kết quả CSV", buffer.getvalue(), "rag-evaluation-results.csv", "text/csv",
         key="rag-eval-csv-download",
     )
+
+    with st.expander("🕘 Lịch sử evaluation đã lưu", expanded=False):
+        saved_runs = [
+            item for item in db.list_evaluation_runs(30)
+            if item.get("knowledge_base_id") == kb_id
+        ]
+        if not saved_runs:
+            st.info("Chưa có run evaluation đã lưu cho kho này.")
+        else:
+            st.dataframe(
+                [
+                    {
+                        "Thời gian": item["created_at"],
+                        "Dataset": item["dataset_hash"][:10],
+                        "Pipeline": ", ".join(item.get("config", {}).get("pipelines", [])),
+                        "Case": item.get("config", {}).get("case_limit", 0),
+                        "Kết quả tổng hợp": json.dumps(item.get("summary", []), ensure_ascii=False),
+                    }
+                    for item in saved_runs
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            latest = saved_runs[0]
+            st.download_button(
+                "Tải kết quả JSON của run gần nhất",
+                json.dumps(latest.get("results", []), ensure_ascii=False, indent=2),
+                f"rag-evaluation-{latest['id'][:8]}.json",
+                "application/json",
+                key=f"rag-eval-history-download-{latest['id']}",
+            )
 
     for row in rows:
         case = row.get("case", {})
@@ -346,10 +461,19 @@ def render_evaluation_workbench(
                     f"trang {source.get('page_number') or '?'} · chunk {chunk_label}"
                 )
             st.json(row.get("metrics", {}))
+            diagnostics = row.get("diagnostics", {})
+            if row.get("pipeline") == "Multi-agent RAG":
+                with st.expander("Agent routing và kết quả chuyên viên", expanded=False):
+                    st.write("Supervisor:", diagnostics.get("supervisor", {}))
+                    for agent in diagnostics.get("agents", []):
+                        st.markdown(f"**{agent.get('agent_name', agent.get('agent_id'))}**")
+                        st.write("Phát hiện:", agent.get("findings", []))
+                        st.write("Chưa đủ dữ kiện:", agent.get("unknowns", []))
+                    st.write("Critic:", diagnostics.get("critic", {}))
+                    st.write("Citation validation:", diagnostics.get("citation_validation", {}))
             if row.get("judge"):
                 st.markdown("**LLM Judge · điểm tham khảo**")
                 st.json(row["judge"])
-            diagnostics = row.get("diagnostics", {})
             meter = diagnostics.get("request_meter", {})
             judge_meter = row.get("judge_meter", {})
             st.caption(
