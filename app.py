@@ -4,22 +4,12 @@ import importlib
 import os
 import re
 import time
-import unicodedata
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from rag_demo.config import ROOT_DIR
-
-load_dotenv(ROOT_DIR / ".env")
-
-from rag_demo.observability import configure_observability
-
-OBSERVABILITY_STATUS = configure_observability()
-
 from rag_demo import db, lab as rag_lab
-from rag_demo.observability import trace_span
 
 # Streamlit can rerun app.py while retaining imported package modules in memory.
 # Reload the lab helpers when the running process still has the older module API.
@@ -47,7 +37,6 @@ from rag_demo.rag import (
     should_use_all_documents,
 )
 from rag_demo.advanced_rag import run_advanced_pipeline
-from rag_demo.evaluation_ui import render_evaluation_workbench
 
 load_dotenv(ROOT_DIR / ".env")
 st.set_page_config(page_title="Chat với kho tài liệu", page_icon="💬", layout="wide")
@@ -63,7 +52,6 @@ _TECHNIQUE_LABELS = {
     "context_compression": "Context Compression (local)",
     "answer_grading": "Answer Grading",
     "citation_verification": "Citation Verification",
-    "corrective_retrieval": "Corrective Retrieval (tối đa 1 lần tìm lại)",
     "langgraph": "LangGraph",
 }
 if not st.session_state.get("_incomplete_docs_recovered"):
@@ -1315,35 +1303,6 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                     plan["hypothetical_answer"],
                 )
         retrieval = diagnostics.get("retrieval", {})
-        retrieval_attempts = diagnostics.get("retrieval_attempts", [])
-        context_grades = diagnostics.get("context_grades", [])
-        if (
-            techniques.get("corrective_retrieval")
-            or int(diagnostics.get("retry_count", 0))
-            or diagnostics.get("abstained_after_retrieval")
-        ):
-            st.markdown("**Corrective Retrieval · tối đa 1 lượt tìm lại**")
-            for attempt in retrieval_attempts:
-                st.write(
-                    f"Lượt {attempt.get('attempt')}: `{attempt.get('query', '')}` · "
-                    f"{attempt.get('candidate_count', 0)} ứng viên"
-                )
-                if attempt.get("top_labels"):
-                    st.caption("Ứng viên top:")
-                    for label in attempt["top_labels"]:
-                        st.markdown(f"- {label}")
-            for grade in context_grades:
-                st.caption(
-                    f"Đánh giá lượt {grade.get('attempt')}: "
-                    f"{'đủ bằng chứng' if grade.get('sufficient') else 'chưa đủ bằng chứng'} · "
-                    f"{grade.get('reason', '')} · context {grade.get('evidence_chars', 0):,} ký tự"
-                )
-                for label in grade.get("evidence_sources", []):
-                    st.markdown(f"- Grader đã xem: {label}")
-                if grade.get("error"):
-                    st.warning(f"Context judge bị bỏ qua: {grade['error']}")
-            if diagnostics.get("abstained_after_retrieval"):
-                st.warning("Đã dừng trước bước sinh câu trả lời vì bằng chứng sau một lần tìm lại vẫn chưa đủ.")
         if retrieval:
             st.markdown("**Tìm kiếm và xếp hạng**")
             if retrieval.get("strategy") == "dense":
@@ -1561,24 +1520,18 @@ def _run_basic_answer(
     started = time.perf_counter()
     if progress:
         progress("Đang chạy RAG cơ bản: tìm nguồn liên quan hoặc đọc toàn kho theo phạm vi câu hỏi…")
-    with trace_span(
-        "rag.basic_pipeline",
-        {"rag.kb_id": kb_id, "rag.mode": mode, "rag.top_k": top_k},
-    ) as span:
-        result = answer_question(
-            kb_id,
-            api_key,
-            query,
-            history,
-            mode=mode,
-            top_k=top_k,
-            embedding_rpm=embedding_rpm,
-            generation_rpm=generation_rpm,
-            progress=progress,
-            meter=meter,
-        )
-        if span:
-            span.set_attribute("rag.source_count", len(result.get("sources", [])))
+    result = answer_question(
+        kb_id,
+        api_key,
+        query,
+        history,
+        mode=mode,
+        top_k=top_k,
+        embedding_rpm=embedding_rpm,
+        generation_rpm=generation_rpm,
+        progress=progress,
+        meter=meter,
+    )
     if progress:
         progress("Đã hoàn tất truy xuất/tổng hợp và tạo câu trả lời.")
     result["diagnostics"] = {
@@ -1639,38 +1592,6 @@ def _conversation_picker_labels(conversations: list[dict]) -> dict[str, str]:
     return labels
 
 
-def _document_picker_labels(documents: list[dict]) -> dict[str, str]:
-    """Disambiguate same-named files in a KB while preserving their stored names."""
-    normalized_names = {
-        item["id"]: " ".join(
-            unicodedata.normalize("NFKC", str(item.get("file_name", "")))
-            .casefold()
-            .split()
-        )
-        for item in documents
-    }
-    counts: dict[str, int] = {}
-    for key in normalized_names.values():
-        counts[key] = counts.get(key, 0) + 1
-    labels: dict[str, str] = {}
-    for item in documents:
-        item_id = str(item["id"])
-        name = str(item.get("file_name", "Tài liệu"))
-        if counts[normalized_names[item_id]] <= 1:
-            labels[item_id] = name
-            continue
-        suffix_length = min(6, len(item_id))
-        while suffix_length < len(item_id) and any(
-            other_id != item_id
-            and normalized_names[other_id] == normalized_names[item_id]
-            and other_id.startswith(item_id[:suffix_length])
-            for other_id in normalized_names
-        ):
-            suffix_length = min(suffix_length + 2, len(item_id))
-        labels[item_id] = f"{name} · {item_id[:suffix_length]}"
-    return labels
-
-
 def _queue_follow_up(query: str, kb_id: str, conversation_id: str) -> None:
     # Keep the exact destination with the prompt; do not infer it from a
     # global picker after Streamlit reruns the page.
@@ -1701,12 +1622,9 @@ def _queue_typed_query() -> None:
 def _create_kb_callback() -> None:
     name = st.session_state.get("new-kb-name", "").strip()
     if name:
-        try:
-            kb_id = db.create_knowledge_base(name)
-            st.session_state["active_kb_id"] = kb_id
-            st.session_state["kb-create-error"] = ""
-        except ValueError as error:
-            st.session_state["kb-create-error"] = str(error)
+        kb_id = db.create_knowledge_base(name)
+        st.session_state["active_kb_id"] = kb_id
+        st.session_state["kb-create-error"] = ""
     else:
         st.session_state["kb-create-error"] = "Nhập tên kho trước khi tạo."
 
@@ -1738,7 +1656,6 @@ def _apply_rag_preset(preset: str) -> None:
         "adv-compress": True,
         "adv-grade": False,
         "adv-citations": False,
-        "adv-corrective-retrieval": False,
         "adv-langgraph": True,
     }
     full = {key: True for key in cheap}
@@ -1748,7 +1665,7 @@ def _apply_rag_preset(preset: str) -> None:
 
 app_surface = st.radio(
     "Khu vực làm việc",
-    ["💬 Chat", "🧪 Phòng thử nghiệm từng bước", "📊 RAG Evaluation"],
+    ["💬 Chat", "🧪 Phòng thử nghiệm từng bước"],
     horizontal=True,
     key="app-surface",
 )
@@ -1763,16 +1680,12 @@ with st.sidebar:
         db.init_db()
         knowledge_bases = db.list_knowledge_bases()
     kb_names = {item["id"]: item["name"] for item in knowledge_bases}
-    kb_display_names = {
-        item["id"]: item.get("display_name", item["name"])
-        for item in knowledge_bases
-    }
     if st.session_state.get("active_kb_id") not in kb_names:
         st.session_state["active_kb_id"] = "default" if "default" in kb_names else next(iter(kb_names))
     kb_id = st.selectbox(
         "Đang chat trong kho",
         options=list(kb_names),
-        format_func=lambda item_id: kb_display_names[item_id],
+        format_func=lambda item_id: kb_names[item_id],
         key="active_kb_id",
     )
 
@@ -1780,7 +1693,7 @@ with st.sidebar:
         st.text_input("Tạo kho mới", placeholder="Ví dụ: Quy trình nhân sự", key="new-kb-name")
         st.form_submit_button("＋ Tạo kho", on_click=_create_kb_callback, use_container_width=True)
     if st.session_state.get("kb-create-error"):
-        st.error(st.session_state["kb-create-error"])
+        st.caption(st.session_state["kb-create-error"])
     if st.session_state.get("kb-delete-success"):
         st.success(st.session_state.pop("kb-delete-success"))
 
@@ -1790,14 +1703,11 @@ with st.sidebar:
             st.text_input("Đổi tên kho", value=selected_kb_name, key=f"rename-kb-name-{kb_id}")
             if st.form_submit_button("Lưu tên kho", use_container_width=True):
                 new_name = st.session_state.get(f"rename-kb-name-{kb_id}", "").strip()
-                try:
+                if not new_name:
+                    st.error("Tên kho không được để trống.")
+                else:
                     db.rename_knowledge_base(kb_id, new_name)
-                    st.session_state.pop(f"kb-rename-error-{kb_id}", None)
                     st.rerun()
-                except ValueError as error:
-                    st.session_state[f"kb-rename-error-{kb_id}"] = str(error)
-        if st.session_state.get(f"kb-rename-error-{kb_id}"):
-            st.error(st.session_state.pop(f"kb-rename-error-{kb_id}"))
         if kb_id == "default":
             st.caption("Kho mặc định luôn được giữ lại để ứng dụng có kho dự phòng.")
         else:
@@ -1934,7 +1844,7 @@ with st.sidebar:
         preset_col2.button(
             "🧪 Bật mọi kỹ thuật",
             key="rag-preset-full",
-            help="Bật planner, audit và Corrective Retrieval; có thể thêm tối đa 2 lượt Gemini cùng một lần retrieval.",
+            help="Bật cả planner Multi-query/HyDE/Rewrite và audit grading/citation để trình diễn đầy đủ.",
             on_click=_apply_rag_preset,
             args=("Đầy đủ",),
             use_container_width=True,
@@ -1949,17 +1859,11 @@ with st.sidebar:
             "context_compression": st.checkbox("Nén ngữ cảnh trích xuất", value=True, key="adv-compress"),
             "answer_grading": st.checkbox("Chấm mức độ hỗ trợ của câu trả lời", value=False, key="adv-grade"),
             "citation_verification": st.checkbox("Xác minh trích dẫn", value=False, key="adv-citations"),
-            "corrective_retrieval": st.checkbox(
-                "Tự đánh giá nguồn và tìm lại tối đa 1 lần",
-                value=False,
-                key="adv-corrective-retrieval",
-                help="Thêm 1–2 lượt Gemini để chấm độ đủ của bằng chứng và tạo truy vấn sửa. Nếu vẫn thiếu, app từ chối sinh câu trả lời.",
-            ),
         }
         use_langgraph = st.checkbox("Điều phối bằng LangGraph", value=True, key="adv-langgraph")
         feature_flags["langgraph"] = use_langgraph
         st.caption(
-            "Mặc định tối ưu tốc độ: dùng tìm kiếm hybrid và các bước local; planner, audit và corrective retrieval tắt cho đến khi cần demo."
+            "Mặc định tối ưu tốc độ: dùng tìm kiếm hybrid và các bước local; bật planner/audit khi cần chất lượng hoặc demo đầy đủ."
         )
         settings_a, settings_b = st.columns(2)
         with settings_a:
@@ -2021,39 +1925,20 @@ with st.sidebar:
             feature_flags[name] for name in ("query_rewrite", "multi_query", "hyde")
         )
         audit_enabled = feature_flags["answer_grading"] or feature_flags["citation_verification"]
-        corrective_calls = 2 * int(feature_flags["corrective_retrieval"])
-        advanced_generation_calls = 1 + int(planner_enabled) + int(audit_enabled) + corrective_calls
+        advanced_generation_calls = 1 + int(planner_enabled) + int(audit_enabled)
         if answer_mode == "So sánh cơ bản và nâng cao":
             st.info(
                 f"Ước tính trước khi hỏi: khoảng {1 + advanced_generation_calls} generation call "
-                f"và tối đa {2 + int(feature_flags['corrective_retrieval'])} embedding call "
-                "(một baseline + tối đa hai batch nâng cao nếu có corrective retrieval). "
+                "và tối đa 2 embedding call (một baseline + một batch nâng cao). "
                 "Multi-query/HyDE dùng chung một planner; grading/citation dùng chung một audit."
             )
         elif answer_mode == "Nâng cao":
             st.caption(
-                f"Ước tính tối đa: {advanced_generation_calls} generation call và "
-                f"{1 + int(feature_flags['corrective_retrieval'])} batch embedding cho lượt hỏi; "
-                "reranker, BM25 và nén ngữ cảnh chạy local. Corrective Retrieval có thể thêm tối đa "
-                "2 generation call và 1 batch embedding; bật riêng khi cần demo hoặc xử lý truy xuất yếu."
+                f"Ước tính: {advanced_generation_calls} generation call và một batch embedding cho lượt hỏi; "
+                "reranker, BM25 và nén ngữ cảnh chạy local. Preset tiết kiệm tắt planner/audit để giảm thêm tối đa 2 generation call."
             )
         if feature_flags["reranker"]:
             st.caption("Reranker đa ngôn ngữ được tải về một lần khi chạy nâng cao lần đầu.")
-        with st.expander("RAG Observability · Phoenix local", expanded=False):
-            if OBSERVABILITY_STATUS.get("enabled"):
-                st.success(
-                    f"Cấu hình trace đã bật · {OBSERVABILITY_STATUS.get('project_name')} · "
-                    f"{OBSERVABILITY_STATUS.get('endpoint')}"
-                )
-            elif OBSERVABILITY_STATUS.get("error"):
-                st.warning(OBSERVABILITY_STATUS["message"])
-                st.caption(OBSERVABILITY_STATUS["error"])
-            else:
-                st.caption(OBSERVABILITY_STATUS["message"])
-            st.caption(
-                "Phoenix thu trace LLM và span retrieval/generation khi được bật; mặc định tracing tắt. "
-                "Gemini vẫn được gọi qua API của Google."
-            )
 
     if "api_key" not in locals():
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -2076,7 +1961,7 @@ with st.sidebar:
 if app_surface == "🧪 Phòng thử nghiệm từng bước":
     _render_stepwise_lab(
         kb_id,
-        kb_display_names.get(kb_id, "Kho tài liệu"),
+        kb_names.get(kb_id, "Kho tài liệu"),
         api_key,
         chunk_size=int(chunk_size),
         chunk_overlap=int(chunk_overlap),
@@ -2089,28 +1974,10 @@ if app_surface == "🧪 Phòng thử nghiệm từng bước":
     )
     st.stop()
 
-if app_surface == "📊 RAG Evaluation":
-    render_evaluation_workbench(
-        root_dir=ROOT_DIR,
-        kb_id=kb_id,
-        kb_name=kb_display_names.get(kb_id, "Kho tài liệu"),
-        api_key=api_key,
-        feature_flags=feature_flags if "feature_flags" in locals() else {},
-        top_k=int(top_k),
-        candidate_k=int(candidate_k) if "candidate_k" in locals() else 24,
-        context_token_budget=int(context_token_budget) if "context_token_budget" in locals() else 4000,
-        embedding_rpm=int(embedding_rpm),
-        generation_rpm=int(generation_rpm),
-        use_langgraph=bool(use_langgraph) if "use_langgraph" in locals() else True,
-        basic_runner=_run_basic_answer,
-        advanced_runner=run_advanced_pipeline,
-    )
-    st.stop()
-
 
 toolbar_left, toolbar_right = st.columns([5, 1])
 with toolbar_left:
-    st.markdown(f"#### {kb_display_names.get(kb_id, 'Kho tài liệu')}")
+    st.markdown(f"#### {kb_names.get(kb_id, 'Kho tài liệu')}")
     st.caption(current_conversation["title"])
 with toolbar_right:
     st.button(
@@ -2366,14 +2233,13 @@ with st.expander(f"🗂️ Tài liệu trong kho · {len(documents)} file · {to
         stat3.metric("Chunk có vector", total_chunks)
         document_ids = [item["id"] for item in documents]
         doc_names = {item["id"]: item["file_name"] for item in documents}
-        doc_display_names = _document_picker_labels(documents)
         doc_selection_key = f"document-selection-{kb_id}"
         if st.session_state.get(doc_selection_key) not in document_ids:
             st.session_state[doc_selection_key] = document_ids[0]
         selected_doc_id = st.selectbox(
             "Chọn tài liệu",
             document_ids,
-            format_func=lambda item_id: doc_display_names[item_id],
+            format_func=lambda item_id: doc_names[item_id],
             key=doc_selection_key,
         )
         selected_doc = next(item for item in documents if item["id"] == selected_doc_id)

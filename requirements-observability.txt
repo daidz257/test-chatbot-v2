@@ -1,4 +1,0 @@
-# Optional local LLM traces; install into the same .venv as the chatbot.
-arize-phoenix
-openinference-instrumentation-google-genai
-openinference-instrumentation-langchain

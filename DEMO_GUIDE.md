@@ -65,9 +65,6 @@ Mỗi tổ hợp planner mới có thể tốn một generation call; nếu quay
 | Trích dẫn sai hoặc câu trả lời yếu | Audit một lần chấm điểm và xác minh nguồn, không tự sửa lặp | Xem điểm, mã trích dẫn chưa hợp lệ và nguồn đã chọn |
 | Kỹ thuật nâng cao khó demo tác động | Chạy baseline và advanced cùng một câu hỏi, lưu hai kết quả | So sánh câu trả lời, nguồn, latency và token |
 | Planner/audit làm tăng request hoặc chạm RPM | Nút Tiết kiệm API tắt planner và audit nhưng vẫn giữ retrieval/rerank/nén local | So sánh API calls/token với cấu hình bật mọi kỹ thuật |
-| Không biết kỹ thuật mới có cải thiện không | Bộ JSONL cố định chạy baseline/advanced cùng câu hỏi, đo source hit/recall, citations, abstention, latency và token | Mở **📊 RAG Evaluation**, chạy vài case rồi tải JSON/CSV |
-| Retrieval sai nhưng câu trả lời vẫn được sinh | Corrective Retrieval chấm đúng context đã chọn để gửi câu trả lời, tìm lại tối đa một lần rồi abstain nếu vẫn thiếu | Bật công tắc trong cài đặt nâng cao và mở diagnostics của lượt hỏi |
-| Khó biết pipeline chậm/lỗi ở node nào | Phoenix local nhận trace LLM và span query planning, retrieval, context, answer, audit, retry | Bật tracing tùy chọn, hỏi lại một case rồi mở UI Phoenix |
 
 ## Chuẩn bị trước buổi trình bày
 
@@ -108,13 +105,3 @@ Chạy thử cùng một bộ câu hỏi ngắn trước buổi demo: một dữ
 | Metadata/lịch sử | SQLite | Kho, file, chunk, hội thoại và trích dẫn |
 | Hybrid/Rerank | BM25 + FlashRank | Hợp nhất từ khóa/vector và xếp lại candidate local |
 | Workflow | LangGraph StateGraph | Điều phối planner → retrieval → compression → answer → audit |
-| Evaluation | Bộ JSONL + phép đo nguồn/citation/abstention | So sánh baseline và advanced, lưu kết quả CSV/JSON; LLM Judge là tùy chọn |
-| Observability | Phoenix + OpenInference + OpenTelemetry | Xem trace provider và span theo bước; mặc định tắt, chạy local |
-
-## Demo task mới: evaluation, trace và agentic loop
-
-Chọn **📊 RAG Evaluation**, dùng kho có tài liệu khớp expected sources, chọn 3–6 case rồi chạy cả RAG cơ bản và nâng cao. Dùng bộ demo 12 câu hỏi hoặc tải JSONL riêng. Chỉ ra một case baseline bỏ sót nguồn, sau đó đối chiếu source recall, câu trả lời, latency và tokens của advanced. Mở một case để xem nguồn file/trang/chunk và reference answer. Bật LLM Judge cho tối đa một case để trình bày cách model chấm correctness/groundedness/relevance; nhấn mạnh điểm judge có thể sai và cần kiểm tra thủ công.
-
-Để demo Corrective Retrieval, bật **Tự đánh giá nguồn và tìm lại tối đa 1 lần**, hỏi case khó rồi mở **Xem pipeline, nguồn và chi phí**. Giải thích rằng app chấm mức đủ của context trước bước sinh, có thể tìm lại một lần và dừng nếu bằng chứng vẫn thiếu. Đây là vòng corrective retrieval có giới hạn, không phải agent tự do hay triển khai đầy đủ paper CRAG/Self-RAG.
-
-Để demo trace, cài dependency riêng bằng `.\.venv\Scripts\python.exe -m pip install -r .\requirements-observability.txt`, đặt `PHOENIX_TRACING_ENABLED=true` trong `.env`, chạy `run-phoenix.ps1` ở terminal thứ nhất rồi khởi động Streamlit ở terminal thứ hai. Mở `http://localhost:6006` sau khi gửi một câu hỏi. Phoenix giúp xem provider span và node nào tốn thời gian; request Gemini vẫn đi qua API Google.

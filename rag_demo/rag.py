@@ -511,26 +511,6 @@ def _normalized_query(query: str) -> str:
 def is_document_count_question(query: str) -> bool:
     """Recognize inventory counts that should come from the local catalog, not Gemini."""
     lowered = _normalized_query(query)
-    # If the query asks for another entity/unit (money, people, percent, time, etc.), it's not inventory count
-    asks_other_quantity = re.search(
-        r"\b(bao nhieu|may)\s+(tien|nguoi|dong|usd|vnd|ty|trieu|nghin|k|%|phan tram|ngay|thang|nam|lan|don vi|chi phi|dinh muc|diem|du an|giai doan|gio|phut|dau moi)\b",
-        lowered,
-    )
-    if asks_other_quantity:
-        return False
-
-    # Prepositional references like "theo tài liệu", "trong tài liệu", "ở tài liệu" indicate the document is the source, not the count target
-    is_source_reference = re.search(
-        r"\b(theo|trong|o|tai|dua tren|can cu vao)\s+(cac\s+|nhung\s+|moi\s+)?(tai lieu|file|tep|van ban)\b",
-        lowered,
-    )
-    mentions_corpus = re.search(
-        r"\b(trong kho|ca kho|toan kho|corpus|knowledge base|da them|hien co|tren he thong)\b",
-        lowered,
-    )
-    if is_source_reference and not mentions_corpus:
-        return False
-
     asks_count = re.search(
         r"\b(bao nhieu|may|tong so|so luong|dem|how many|number of|count)\b",
         lowered,
@@ -540,7 +520,7 @@ def is_document_count_question(query: str) -> bool:
         r"\b(noi ve|chua|co noi dung|lien quan|de cap|mentions?|contains?)\b",
         lowered,
     )
-    asks_about_other_measure = re.search(r"\b(trang|pages?|chunk|tokens?|tien|cost|price)\b", lowered)
+    asks_about_other_measure = re.search(r"\b(trang|pages?|chunk|tokens?)\b", lowered)
     return bool(
         asks_count
         and asks_for_files

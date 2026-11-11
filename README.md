@@ -1,6 +1,6 @@
 # Kho tri thức AI — demo local
 
-Ứng dụng hỏi đáp trên tài liệu riêng theo mô hình RAG. Giao diện chính là chatbot: tạo kho, thêm tài liệu và hỏi đáp có nguồn. Có thể đổi tên/xóa kho, tài liệu và hội thoại; xem chunk, nguồn và pipeline đã tạo câu trả lời. Tên kho được kiểm tra không trùng sau khi chuẩn hóa Unicode, chữ hoa/thường và khoảng trắng; nếu dữ liệu cũ đã có kho trùng tên, giao diện thêm mã ngắn để phân biệt.
+Ứng dụng hỏi đáp trên tài liệu riêng theo mô hình RAG. Giao diện chính là chatbot: tạo kho, thêm tài liệu và hỏi đáp có nguồn. Có thể đổi tên/xóa kho, tài liệu và hội thoại; xem chunk, nguồn và pipeline đã tạo câu trả lời.
 
 ## Chạy trên Windows
 
@@ -67,15 +67,15 @@ Mở [DEMO_GUIDE.md](DEMO_GUIDE.md) để dùng kịch bản demo 5 phút, sơ �
 
 Trong **Kết nối AI & tùy chọn nâng cao**, có thể chọn **Cơ bản**, **Nâng cao** hoặc **So sánh cơ bản và nâng cao** cho cùng một câu hỏi. Chế độ so sánh lưu cả hai câu trả lời, nguồn và số liệu vào lịch sử để trình bày.
 
-Pipeline nâng cao có thể bật/tắt Parent-Child context, Hybrid Search (Chroma dense + BM25), FlashRank reranker, Query Rewrite, Multi-query (tối đa hai query phụ), HyDE, nén ngữ cảnh trích xuất, answer grading, citation verification, Corrective Retrieval và LangGraph. Các query Rewrite/Multi-query/HyDE dùng chung một lần lập kế hoạch Gemini; các truy vấn embedding được gửi theo batch. Reranker chạy local sau lần tải model đầu.
+Pipeline nâng cao có thể bật/tắt Parent-Child context, Hybrid Search (Chroma dense + BM25), FlashRank reranker, Query Rewrite, Multi-query (tối đa hai query phụ), HyDE, nén ngữ cảnh trích xuất, answer grading, citation verification và LangGraph. Các query Rewrite/Multi-query/HyDE dùng chung một lần lập kế hoạch Gemini; các truy vấn embedding được gửi theo batch. Reranker chạy local sau lần tải model đầu.
 
 Khi bật Query Rewrite, bước sinh câu trả lời vẫn nhận tối đa một lượt hội thoại gần nhất để hiểu câu hỏi nối tiếp. Lịch sử chỉ dùng để giải quyết chủ thể/đại từ; dữ kiện và trích dẫn phải dựa trên các nguồn được truy xuất ở lượt hiện tại.
 
 Để truy vấn phụ không lấn át câu hỏi gốc, RRF dùng trọng số cao nhất cho Dense của câu gốc; Rewrite/Multi-query có trọng số thấp hơn và HyDE chỉ tham gia Dense với trọng số nhỏ (không dùng BM25). Candidate pool luôn giữ các Dense hit đầu của câu gốc; context dành tối đa hai nhóm nguồn riêng cho các hit đó và không nén chúng. Pipeline hiển thị top sau RRF, top sau reranker và nguồn thực sự gửi Gemini để kiểm tra trường hợp truy xuất bỏ sót.
 
-Chi phí được khống chế bằng cách giữ pipeline cơ bản làm lựa chọn riêng, giới hạn query phụ và số ứng viên rerank, đặt ngân sách token cho đoạn tài liệu, giới hạn output planner/audit, gom grading và citation vào một lượt audit. **Corrective Retrieval** là tùy chọn riêng: Gemini chấm độ đủ bằng chứng, có thể thêm một lượt đánh giá sau khi tìm lại (tối đa 1 retry); nếu vẫn thiếu thì dừng trước bước sinh. Đây là vòng corrective retrieval lấy cảm hứng từ evaluator-optimizer/CRAG, không phải triển khai đầy đủ paper CRAG hay Self-RAG. Mặc định planner/audit/corrective retrieval tắt để giảm độ trễ; nút **Tiết kiệm API** giữ cấu hình này, còn **Bật mọi kỹ thuật** bật toàn bộ để trình diễn. So sánh chạy cả hai pipeline nên tốn tổng chi phí của hai lượt. Số request/token được lưu cùng câu trả lời; token lấy từ Gemini usage metadata nếu có, nếu không ước tính từ độ dài ký tự.
+Chi phí được khống chế bằng cách giữ pipeline cơ bản làm lựa chọn riêng, giới hạn query phụ và số ứng viên rerank, đặt ngân sách token cho đoạn tài liệu, giới hạn output planner/audit, gom chấm điểm và xác minh vào một lượt audit, và không tự gọi thêm lượt sửa câu trả lời. Mặc định planner/audit tắt để giảm độ trễ; nút **Tiết kiệm API** giữ cấu hình này, còn **Bật mọi kỹ thuật** bật toàn bộ để trình diễn. Có thể đổi từng công tắc riêng sau khi chọn preset. So sánh chủ động chạy cả pipeline cơ bản và nâng cao nên chi phí lượt đó gần bằng tổng hai lượt. Số request và token được lưu cùng câu trả lời; token lấy từ usage metadata Gemini nếu có, nếu không sẽ ước tính từ độ dài ký tự.
 
-Mỗi lượt nâng cao cần một embedding batch và một generation call để trả lời; Rewrite/Multi-query/HyDE chia sẻ tối đa một generation call lập kế hoạch; grading/citation chia sẻ tối đa một generation call audit. Corrective Retrieval thêm tối đa hai generation call và một batch embedding nếu phải tìm lại. Reranker, BM25, nén ngữ cảnh và LangGraph chạy cục bộ. Mở **So sánh cơ bản và nâng cao** để xem cả hai câu trả lời, nguồn, API calls, token và thời gian. Mở **Nguồn đã dùng** để xem child chunk và ngữ cảnh thực sự đã gửi cho Gemini.
+Mỗi lượt nâng cao cần một embedding batch và một generation call để trả lời; Rewrite/Multi-query/HyDE chia sẻ tối đa một generation call lập kế hoạch; grading/citation chia sẻ tối đa một generation call audit. Reranker, BM25, nén ngữ cảnh và LangGraph chạy cục bộ. Mở **So sánh cơ bản và nâng cao** để xem cả hai câu trả lời, file/trang/chunk, số nguồn trùng, API calls, token và thời gian. Mở **Nguồn đã dùng** để xem child chunk và, nếu parent/compression làm thay đổi văn bản, đúng ngữ cảnh đã gửi cho Gemini.
 
 Parent chunks của tài liệu mới được tạo lúc nhập file. Khi mở dữ liệu cũ, ứng dụng tự tạo nhóm parent từ tối đa ba child chunks liên tiếp để dùng ngay; đây là parent dẫn xuất từ chunk cũ, còn nhập lại file sẽ tạo phân cấp mới từ nội dung gốc. Ngân sách ngữ cảnh nâng cao giới hạn lượng nội dung gửi cho câu trả lời.
 
@@ -96,28 +96,3 @@ Phòng thử nghiệm không thêm file vào kho thường trong lúc xem trư�
 Tìm kiếm cơ bản lấy top-k chunk gần nhất theo cosine distance nhưng hiện chưa có ngưỡng từ chối đã hiệu chỉnh. Vì vậy, câu hỏi ngoài phạm vi vẫn có thể đưa các chunk gần nhất vào Gemini. Distance là chỉ số xếp hạng, không phải xác suất câu trả lời đúng; không nên dùng một ngưỡng cố định như 0.70 cho mọi kho nếu chưa đánh giá bằng câu hỏi có đáp án và câu hỏi ngoài phạm vi. Pipeline nâng cao cũng không tự sửa câu trả lời khi điểm audit thấp.
 
 Nén ngữ cảnh là phép chọn đoạn/dòng dựa trên từ khóa sau khi bỏ một số từ dừng tiếng Việt phổ biến. Khi không tìm được từ khóa nội dung trùng, ứng dụng giữ phần đầu và cuối thay vì chỉ lấy đầu đoạn; với bảng, tiêu đề được giữ và thứ tự các hàng được chọn vẫn theo tài liệu gốc. Đây vẫn là phép nén có mất mát, nên cần mở nội dung nguồn khi trả lời về số liệu/bảng quan trọng.
-
-## RAG Evaluation, Observability và Agentic Design Patterns
-
-Chọn **📊 RAG Evaluation** để chạy cùng một JSONL dataset qua RAG cơ bản, nâng cao hoặc cả hai. Bộ demo 12 case bao gồm tra cứu dữ kiện/số liệu, hỏi thiếu bằng chứng và câu cần hai file; có thể tải JSONL template, giới hạn số case để kiểm soát quota, bật LLM Judge tùy chọn, xem nguồn/trang/chunk và tải kết quả CSV/JSON.
-
-Các phép đo gồm expected-source hit/recall/precision, citation ID hợp lệ và có citation, độ chính xác từ chối theo nhãn `answerable`, latency và request/token. Đây là metric MVP cho demo: hit/recall phụ thuộc nhãn nguồn; từ chối dùng heuristic; LLM Judge có thể sai và tốn thêm một generation call mỗi đáp án. So sánh có ý nghĩa nhất khi dùng cùng kho, dataset, top-k và cấu hình. Không dùng điểm tổng hợp làm bằng chứng thống kê nếu số case nhỏ.
-
-Phoenix tracing là tùy chọn và mặc định tắt. Cài dependency bổ sung rồi bật env để trace Gemini provider calls cùng span retrieval/context/generation/audit/retry. Khi chạy script local, Phoenix lưu dữ liệu ở `data/phoenix`. Gemini vẫn nhận request qua API Google.
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r .\requirements-observability.txt
-# Terminal 1: mở Phoenix local
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-phoenix.ps1
-# Trong .env: đặt PHOENIX_TRACING_ENABLED=true
-# Terminal 2: chạy chatbot bằng .\run.ps1
-```
-
-Các design patterns có trong demo:
-
-- **Deterministic workflow:** LangGraph điều phối các node planner (tùy chọn), retrieval, context, answer và audit.
-- **Bounded corrective retrieval:** context grader đánh giá độ đủ, đề xuất một truy vấn sửa, retry tối đa một lần rồi abstain nếu vẫn yếu. Đây là evaluator-optimizer có giới hạn chi phí, lấy cảm hứng từ corrective RAG; không tuyên bố là triển khai đầy đủ paper CRAG hay Self-RAG.
-- **Observability spans:** provider instrumentation ghi lời gọi Gemini; span nghiệp vụ theo dõi retrieval, context, generation, audit và evaluation case.
-- **Dataset-driven evaluation:** câu hỏi, đáp án tham chiếu và nguồn kỳ vọng được lưu JSONL; baseline và advanced chạy trên cùng case.
-
-Xem [DEMO_GUIDE.md](DEMO_GUIDE.md) để có kịch bản trình bày và [docs/RAG_EVALUATION_OBSERVABILITY.md](docs/RAG_EVALUATION_OBSERVABILITY.md) để biết cách diễn giải metric, chi phí và giới hạn.

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -198,87 +197,30 @@ def list_knowledge_bases() -> list[dict[str, Any]]:
         rows = db.execute(
             "SELECT id, name, created_at FROM knowledge_bases ORDER BY created_at"
         ).fetchall()
-    items = [dict(row) for row in rows]
-    normalized_counts: dict[str, int] = {}
-    for item in items:
-        key = _knowledge_base_name_key(item["name"])
-        normalized_counts[key] = normalized_counts.get(key, 0) + 1
-    for item in items:
-        name_key = _knowledge_base_name_key(item["name"])
-        if normalized_counts[name_key] <= 1:
-            item["display_name"] = item["name"]
-            continue
-        suffix_length = min(6, len(item["id"]))
-        while suffix_length < len(item["id"]) and any(
-            other["id"] != item["id"]
-            and _knowledge_base_name_key(other["name"]) == name_key
-            and other["id"].startswith(item["id"][:suffix_length])
-            for other in items
-        ):
-            suffix_length = min(suffix_length + 2, len(item["id"]))
-        item["display_name"] = f"{item['name']} · {item['id'][:suffix_length]}"
-    return items
-
-
-def _knowledge_base_name_key(name: str) -> str:
-    normalized = unicodedata.normalize("NFKC", str(name)).casefold()
-    return " ".join(normalized.split())
-
-
-def _clean_knowledge_base_name(name: str) -> str:
-    cleaned = " ".join(unicodedata.normalize("NFC", str(name)).split())
-    if not cleaned:
-        raise ValueError("Tên kho không được để trống.")
-    if len(cleaned) > 100:
-        raise ValueError("Tên kho không được dài quá 100 ký tự.")
-    return cleaned
-
-
-def _ensure_unique_knowledge_base_name(
-    connection: sqlite3.Connection, name: str, *, exclude_id: str | None = None
-) -> None:
-    for row in connection.execute("SELECT id, name FROM knowledge_bases").fetchall():
-        if row["id"] != exclude_id and _knowledge_base_name_key(row["name"]) == _knowledge_base_name_key(name):
-            raise ValueError(
-                f"Tên kho “{row['name']}” đã tồn tại (mã {row['id'][:6]}). "
-                "Chọn kho hiện có hoặc nhập tên khác."
-            )
+    return [dict(row) for row in rows]
 
 
 def create_knowledge_base(name: str) -> str:
-    cleaned = _clean_knowledge_base_name(name)
     kb_id = uuid.uuid4().hex
     with connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        _ensure_unique_knowledge_base_name(db, cleaned)
         db.execute(
             "INSERT INTO knowledge_bases(id, name, created_at) VALUES(?, ?, ?)",
-            (kb_id, cleaned, _now()),
+            (kb_id, name.strip(), _now()),
         )
     return kb_id
 
 
 def rename_knowledge_base(kb_id: str, name: str) -> None:
-    cleaned = _clean_knowledge_base_name(name)
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Tên kho không được để trống.")
     with connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        current = db.execute(
-            "SELECT name FROM knowledge_bases WHERE id = ?", (kb_id,)
-        ).fetchone()
-        if current is None:
-            raise ValueError("Không tìm thấy kho tài liệu.")
-        if _knowledge_base_name_key(current["name"]) == _knowledge_base_name_key(cleaned):
-            if current["name"] != cleaned:
-                db.execute(
-                    "UPDATE knowledge_bases SET name = ? WHERE id = ?",
-                    (cleaned, kb_id),
-                )
-            return
-        _ensure_unique_knowledge_base_name(db, cleaned, exclude_id=kb_id)
-        db.execute(
+        cursor = db.execute(
             "UPDATE knowledge_bases SET name = ? WHERE id = ?",
-            (cleaned, kb_id),
+            (cleaned[:100], kb_id),
         )
+        if cursor.rowcount == 0:
+            raise ValueError("Không tìm thấy kho tài liệu.")
 
 
 def delete_knowledge_base_record(kb_id: str) -> None:
