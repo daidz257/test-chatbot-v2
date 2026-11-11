@@ -28,15 +28,12 @@ def load_jsonl_cases(payload: str) -> list[dict[str, Any]]:
         question = str(item.get("question", "")).strip()
         reference = str(item.get("reference_answer", "")).strip()
         expected_sources = item.get("expected_sources", [])
-        expected_agents = item.get("expected_agents", [])
         if not case_id or not question:
             raise ValueError(f"JSONL dòng {line_number} cần có id và question.")
         if case_id in seen_ids:
             raise ValueError(f"ID '{case_id}' bị lặp ở JSONL dòng {line_number}.")
         if not isinstance(expected_sources, list) or any(not str(value).strip() for value in expected_sources):
             raise ValueError(f"expected_sources ở dòng {line_number} phải là danh sách tên file.")
-        if not isinstance(expected_agents, list) or any(not str(value).strip() for value in expected_agents):
-            raise ValueError(f"expected_agents ở dòng {line_number} phải là danh sách agent ID.")
         if "answerable" not in item or not isinstance(item.get("answerable"), bool):
             raise ValueError(f"answerable ở dòng {line_number} phải là true hoặc false.")
         if item["answerable"] and not reference:
@@ -50,7 +47,6 @@ def load_jsonl_cases(payload: str) -> list[dict[str, Any]]:
                 "expected_sources": [str(value).strip() for value in expected_sources],
                 "answerable": item["answerable"],
                 "category": str(item.get("category", "general"))[:80],
-                "expected_agents": [str(value).strip() for value in expected_agents],
             }
         )
     if not cases:
@@ -123,26 +119,6 @@ def case_metrics(
         "citation_check_passed": not invalid_citations
         and (bool(cited) or not bool(case.get("answerable")) or abstained),
         "invalid_citations": invalid_citations,
-    }
-
-
-def agent_selection_metrics(
-    case: dict[str, Any], selected_agent_ids: list[str]
-) -> dict[str, Any]:
-    expected = {str(value) for value in case.get("expected_agents", []) if str(value)}
-    if not expected:
-        return {"agent_selection_precision": None, "agent_selection_recall": None, "agent_selection_f1": None}
-    actual = {str(value) for value in selected_agent_ids if str(value)}
-    overlap = len(expected & actual)
-    precision = overlap / len(actual) if actual else 0.0
-    recall = overlap / len(expected)
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {
-        "agent_selection_precision": round(precision, 3),
-        "agent_selection_recall": round(recall, 3),
-        "agent_selection_f1": round(f1, 3),
-        "expected_agents": sorted(expected),
-        "selected_agents": sorted(actual),
     }
 
 
@@ -239,9 +215,6 @@ def aggregate_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "correct_abstention_rate": mean("abstention_correct"),
                 "valid_citation_rate": mean("citation_refs_valid"),
                 "citation_check_pass_rate": mean("citation_check_passed"),
-                "agent_selection_precision": mean("agent_selection_precision"),
-                "agent_selection_recall": mean("agent_selection_recall"),
-                "agent_selection_f1": mean("agent_selection_f1"),
                 "mean_pipeline_latency_ms": round(
                     sum(int(row.get("diagnostics", {}).get("latency_ms", 0)) for row in successful)
                     / len(successful)

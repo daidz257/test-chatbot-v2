@@ -2,14 +2,14 @@
 
 ## Mục tiêu demo
 
-Trình bày thay đổi chất lượng bằng dữ liệu thay vì chỉ bật nhiều kỹ thuật rồi so một câu trả lời. Bộ evaluation giữ cố định câu hỏi, kho, nhãn đáp án/nguồn và có thể so sánh RAG cơ bản, cấu hình nâng cao và multi-agent.
+Trình bày một thay đổi chất lượng bằng dữ liệu thay vì chỉ bật nhiều kỹ thuật rồi so một câu trả lời. Bộ evaluation giữ cố định câu hỏi, kho, nhãn đáp án/nguồn và so sánh RAG cơ bản với cấu hình nâng cao đang bật.
 
 ## Chạy benchmark
 
 1. Chọn kho có chứa các tài liệu được liệt kê trong `evals/demo_dataset.jsonl`, hoặc upload JSONL riêng phù hợp với kho đó.
 2. Mở khu vực **RAG Evaluation**.
-3. Chọn một hoặc nhiều pipeline: RAG cơ bản, nâng cao, Multi-agent RAG; để số case thấp lúc đầu nhằm kiểm soát quota. Khi bật Multi-agent, mỗi lượt giới hạn tối đa 3 case.
-4. Xem ước tính request trước khi chạy. Planner/audit/corrective retrieval của advanced và số specialist/Critic của multi-agent được tính vào ước tính tối đa.
+3. Chọn RAG cơ bản, nâng cao hoặc cả hai; để số case thấp lúc đầu nhằm kiểm soát quota.
+4. Xem ước tính request trước khi chạy. Planner/audit/corrective retrieval đang bật trong phần cài đặt nâng cao sẽ được tính vào ước tính tối đa.
 5. Chạy evaluation; xem bảng tổng hợp, rồi mở case để đối chiếu đáp án tham chiếu, nguồn kỳ vọng, file/trang/chunk đã truy xuất và câu trả lời.
 6. Tải JSON/CSV làm artifact cho buổi review. JSON giữ metrics/diagnostics theo case; CSV thuận tiện cho bảng tính.
 
@@ -29,7 +29,6 @@ Mỗi dòng là một case:
 - `expected_sources`: tên file được gán thủ công là nguồn cần thiết. Case không trả lời được vẫn có thể kỳ vọng truy xuất đúng file nhưng câu trả lời phải từ chối suy đoán.
 - `answerable`: nhãn của người tạo dataset, không do model tự sinh.
 - `category`: phân nhóm tùy chọn, ví dụ `numeric lookup`, `table`, `multi-document`, `abstention`.
-- `expected_agents`: tùy chọn; danh sách specialist ID được đánh giá là phù hợp, ví dụ `["table_analyst"]`. Đây là nhãn thủ công và chỉ được dùng tính routing metrics cho Multi-agent RAG.
 
 ## Metric trong giao diện
 
@@ -43,7 +42,6 @@ Mỗi dòng là một case:
 | Correct abstention | Cụm từ từ chối khớp với `answerable=false`, hoặc không từ chối khi case có đáp án | Heuristic dò cụm từ tiếng Việt/Anh; cần xem thủ công |
 | Latency/API/tokens | Lấy từ diagnostics `RequestMeter`, gồm token metadata hoặc ước tính | Request retry cũng được tính; token có thể ước tính theo ký tự khi Gemini không trả usage metadata |
 | LLM Judge | Gemini chấm correctness, groundedness và answer relevance 1–5 với reference/context | Tốn thêm một generation call mỗi output; model judge có thiên lệch và không phải ground truth |
-| Agent routing precision/recall/F1 | So tập `expected_agents` với ID specialist do Supervisor chọn | Chỉ có khi dataset gán expected_agents; lựa chọn agent không khẳng định câu trả lời đúng |
 
 Benchmark nhỏ có ích cho regression/demo, không đủ để khẳng định cải thiện có ý nghĩa thống kê. Để so sánh công bằng, dùng cùng kho, dataset, top-k, model và phiên bản parser. Với bảng hoặc câu hỏi nhiều đoạn, thêm nhiều câu hỏi và spot-check context/source thủ công. Cân nhắc chạy lại một số case để nhận ra biến thiên của LLM.
 
@@ -73,7 +71,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-phoenix.ps1
 
 Sau đó chạy Streamlit từ terminal thứ hai bằng `.un.ps1`. Phoenix UI mặc định ở `http://localhost:6006`; app xuất OTLP traces đến endpoint trong `.env`. Script đặt `PHOENIX_WORKING_DIR` thành `data/phoenix` để dữ liệu Phoenix của demo nằm cạnh dữ liệu app.
 
-Instrument cả Google GenAI provider và LangChain orchestration, đồng thời tạo span cấp nghiệp vụ cho query planning, retrieval (kèm attempt), context grading/build, answer generation, audit, từng evaluation case và các node agent (`agent.supervisor.route`, `agent.specialist`, `agent.synthesis`, `agent.critic_citation_check`). Điều này phân biệt thời gian/lỗi provider với node retrieval/context/agent. Một lượt chat cơ bản có thể chỉ hiện các span provider vì các node cơ bản chưa phải toàn bộ custom spans.
+Instrument cả Google GenAI provider và LangChain orchestration, đồng thời tạo span cấp nghiệp vụ cho query planning, retrieval (kèm attempt), context grading/build, answer generation, audit và từng evaluation case. Điều này phân biệt thời gian/ lỗi provider với node retrieval/context. Một lượt chat cơ bản có thể chỉ hiện các span provider vì các node cơ bản chưa phải toàn bộ custom spans.
 
 Trace có thể chứa prompt, câu hỏi, nội dung chunk và câu trả lời. Chỉ bật trong buổi demo local khi phù hợp; việc lưu trace local không làm cho request Gemini trở thành xử lý local. Việc gọi model vẫn đi qua API Google.
 
@@ -97,20 +95,6 @@ Chi phí tối đa theo cấu hình: hai context-grade generation calls và thê
 ### 3. Vì sao đây là workflow agentic có giới hạn
 
 LangGraph ở đây quản lý trạng thái, thứ tự node và nhánh retry/abstain. Model chỉ được dùng ở các điểm cụ thể (plan, context grade, answer, audit); nó không tự tạo tool mới hoặc lặp theo ý muốn. Đây là lựa chọn phù hợp demo vì chi phí, request cap và điều kiện kết thúc đọc được trên sơ đồ và trace. Khi cần mở rộng, có thể thêm node query decomposition, alternate retriever hoặc human review, rồi đo từng thay đổi bằng cùng eval dataset.
-
-### 4. Multi-agent supervisor / worker
-
-Khu vực **🧭 Kịch bản sản phẩm** và lựa chọn **Multi-agent** trong chat dùng graph riêng:
-
-```text
-Retrieve một lần → Supervisor route → Specialists → Synthesis → Critic → citation ID check
-```
-
-Supervisor chỉ chọn trong agent allowlist; tối đa 1–3 specialists. Mỗi specialist có role cụ thể: bằng chứng, bảng, đối chiếu tài liệu, yêu cầu hoặc rủi ro/thiếu dữ liệu. Các worker chạy tuần tự theo RPM gate, nhận cùng context và không tự tạo thêm retrieval. Synthesis gộp findings thành câu trả lời/gợi ý; Critic kiểm tra với nguồn gốc và có thể sửa câu trả lời một lần. Không có agent loop vô hạn hay tự do gọi tool.
-
-Hai specialist và Critic bật tương đương tối đa 5 generation calls cộng 1 embedding batch. Evaluation giới hạn 3 case nếu chọn pipeline này và cho phép giảm worker/tắt Critic. Lịch sử scenario lưu snapshot cấu hình; evaluation run lưu hash dataset, flags, metrics và kết quả trong SQLite. Tab overview trong app giải thích LangChain/LangGraph, role của từng agent và chi phí.
-
-`expected_agents` là optional JSONL label do người tạo dataset khai báo. Khi có nhãn, UI tính precision/recall/F1 của route; metric này chỉ đánh giá chọn specialist, không thay thế source recall, citation, correctness hoặc spot-check. Kết quả multi-agent có thể tốn token hơn RAG nâng cao; cần nhìn cùng retrieval/source/answer quality, latency và usage.
 
 ## Tài liệu tham khảo
 
