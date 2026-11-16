@@ -4,3 +4,15 @@ __pycache__/
 .env
 data/
 .streamlit/secrets.toml
+
+.presentation-build/
+.codex-build/
+chroma_db/
+~$*
+
+# Ignore older slide drafts (only keep v4)
+Bao_Cao_Thuc_Tap_RAG_Agentic_FOXAI.pptx
+Bao_Cao_Thuc_Tap_RAG_Chatbot_2026-11-13_v2.pptx
+Bao_Cao_Thuc_Tap_RAG_Chatbot_2026-11-13_v3*.pptx
+RAG_Mentor_Demo_2026-11-16_LangChain_Agentic_Updated.pptx
+

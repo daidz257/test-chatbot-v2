@@ -4,12 +4,22 @@ import importlib
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
+from rag_demo.config import ROOT_DIR
+
+load_dotenv(ROOT_DIR / ".env")
+
+from rag_demo.observability import configure_observability
+
+OBSERVABILITY_STATUS = configure_observability()
+
 from rag_demo import db, lab as rag_lab
+from rag_demo.observability import trace_span
 
 # Streamlit can rerun app.py while retaining imported package modules in memory.
 # Reload the lab helpers when the running process still has the older module API.
@@ -26,7 +36,9 @@ from rag_demo.config import (
 )
 from rag_demo.quota import GeminiRequestError
 from rag_demo.quota import RequestMeter
+from rag_demo.speech import render_tts_player, transcribe_vietnamese
 from rag_demo.rag import (
+    _document_inventory_answer,
     answer_question,
     delete_document,
     delete_knowledge_base,
@@ -35,11 +47,29 @@ from rag_demo.rag import (
     is_document_list_question,
     retry_document_index,
     should_use_all_documents,
+    validate_answer_citations,
 )
 from rag_demo.advanced_rag import run_advanced_pipeline
+from rag_demo.agentic_patterns import route_with_function_calling
+from rag_demo.evaluation_ui import render_evaluation_workbench
+from rag_demo.agentic_demo_ui import render_agentic_demo
 
 load_dotenv(ROOT_DIR / ".env")
 st.set_page_config(page_title="Chat với kho tài liệu", page_icon="💬", layout="wide")
+
+from rag_demo import scenarios as scenario_ui
+
+# Streamlit caches helper modules across reruns. Reload the scenario module only
+# when its source file changes so the inline component is not re-registered on
+# every widget interaction.
+scenario_source_mtime = Path(scenario_ui.__file__).stat().st_mtime_ns
+known_scenario_source_mtime = st.session_state.get("_scenario_source_mtime")
+if known_scenario_source_mtime is None:
+    st.session_state["_scenario_source_mtime"] = scenario_source_mtime
+elif known_scenario_source_mtime != scenario_source_mtime:
+    scenario_ui = importlib.reload(scenario_ui)
+    st.session_state["_scenario_source_mtime"] = Path(scenario_ui.__file__).stat().st_mtime_ns
+
 db.init_db()
 
 _TECHNIQUE_LABELS = {
@@ -52,6 +82,10 @@ _TECHNIQUE_LABELS = {
     "context_compression": "Context Compression (local)",
     "answer_grading": "Answer Grading",
     "citation_verification": "Citation Verification",
+    "corrective_retrieval": "Corrective Retrieval (tối đa 1 lần tìm lại)",
+    "function_call_router": "Function Calling Router",
+    "query_decomposition": "Query Decomposition (tối đa 3 câu con)",
+    "reflection_loop": "Reflection (tối đa 1 lần sửa)",
     "langgraph": "LangGraph",
 }
 if not st.session_state.get("_incomplete_docs_recovered"):
@@ -172,6 +206,12 @@ def _source_display_label(source: dict, index: int) -> str:
             label += f" · child của Parent {parent_index + 1}"
     if source.get("is_dense_anchor"):
         label += " · Dense gốc được giữ"
+    if source.get("is_reference_anchor"):
+        label += " · khớp chính xác mục/điều được hỏi"
+    elif source.get("is_reference_context"):
+        label += " · tiêu đề/cột của bảng mục được hỏi"
+    elif source.get("is_reference_continuation"):
+        label += " · trang tiếp theo có thể nối tiếp nội dung"
     return label
 
 
@@ -1278,6 +1318,14 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
             f"Generation: {meter.get('generation_calls', 0)} request · "
             f"Tổng token: {meter.get('total_tokens', 0)}"
         )
+        answer_validation = diagnostics.get("answer_validation", {})
+        if answer_validation:
+            if answer_validation.get("invalid_refs"):
+                st.error(f"Citation ID không có trong nguồn: {', '.join(answer_validation['invalid_refs'])}")
+            elif not answer_validation.get("passed"):
+                st.warning("Câu trả lời thiếu citation hoặc nội dung từ chối rõ ràng; cần kiểm tra nguồn.")
+            else:
+                st.caption("Kiểm tra citation ID/presence đạt. Phép kiểm tra này chưa xác minh ngữ nghĩa từng claim.")
         if meter.get("estimated_token_calls"):
             st.caption(meter.get("token_note", "Một phần token là ước tính vì API không trả usage metadata."))
         if meter.get("labels"):
@@ -1297,15 +1345,80 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
             st.write(f"Truy vấn sau rewrite: {plan.get('rewritten_query') or 'Không đổi'}")
             if plan.get("alternative_queries"):
                 st.write("Multi-query:", plan["alternative_queries"])
+            if plan.get("decomposition_queries"):
+                st.write("Query decomposition:", plan["decomposition_queries"])
             if plan.get("hypothetical_answer"):
                 st.write(
                     "HyDE (giả thuyết chỉ dùng để tìm kiếm, không phải dữ kiện đã xác minh):",
                     plan["hypothetical_answer"],
                 )
+        agentic_route = diagnostics.get("agentic_route", {})
+        if agentic_route:
+            st.markdown("**Function Calling router**")
+            if agentic_route.get("error"):
+                st.warning(
+                    f"Router lỗi, đã fallback về route mặc định: {agentic_route['error']}"
+                )
+            else:
+                st.write(
+                    f"Route: {agentic_route.get('label', agentic_route.get('route', '—'))} · "
+                    f"Lý do: {agentic_route.get('reason', '—')}"
+                )
         retrieval = diagnostics.get("retrieval", {})
+        retrieval_attempts = diagnostics.get("retrieval_attempts", [])
+        context_grades = diagnostics.get("context_grades", [])
+        if diagnostics.get("reflection_status"):
+            reflection_labels = {
+                "passed": "Reflection audit đạt.",
+                "unresolved_after_one_repair": "Reflection chưa đạt sau một lần sửa; câu trả lời đã bị thay bằng thông báo chưa đủ căn cứ.",
+                "audit_unavailable": "Reflection audit không chạy được; câu trả lời chưa được phát hành như kết quả đã xác minh.",
+            }
+            st.markdown("**Reflection · tự kiểm tra và sửa tối đa một lần**")
+            st.write(reflection_labels.get(diagnostics["reflection_status"], diagnostics["reflection_status"]))
+            st.caption(f"Số lần sửa: {diagnostics.get('reflection_count', 0)}")
+            for audit_index, audit in enumerate(diagnostics.get("audit_history", []), start=1):
+                llm_audit = audit.get("llm_audit", {})
+                st.caption(
+                    f"Audit {audit_index}: điểm {llm_audit.get('grade', '—')}/5 · "
+                    f"{llm_audit.get('grade_reason', audit.get('error', 'Không có ghi chú'))}"
+                )
+                if llm_audit.get("unsupported_claims"):
+                    st.write("Claim chưa được hỗ trợ:", llm_audit["unsupported_claims"])
+                if llm_audit.get("citation_issues"):
+                    st.write("Vấn đề citation:", llm_audit["citation_issues"])
+            if diagnostics.get("reflection_unverified_draft"):
+                with st.expander("Bản nháp bị chặn vì chưa qua audit", expanded=False):
+                    st.write(diagnostics["reflection_unverified_draft"])
+        if (
+            techniques.get("corrective_retrieval")
+            or int(diagnostics.get("retry_count", 0))
+            or diagnostics.get("abstained_after_retrieval")
+        ):
+            st.markdown("**Corrective Retrieval · tối đa 1 lượt tìm lại**")
+            for attempt in retrieval_attempts:
+                st.write(
+                    f"Lượt {attempt.get('attempt')}: `{attempt.get('query', '')}` · "
+                    f"{attempt.get('candidate_count', 0)} ứng viên"
+                )
+                if attempt.get("top_labels"):
+                    st.caption("Ứng viên top:")
+                    for label in attempt["top_labels"]:
+                        st.markdown(f"- {label}")
+            for grade in context_grades:
+                st.caption(
+                    f"Đánh giá lượt {grade.get('attempt')}: "
+                    f"{'đủ bằng chứng' if grade.get('sufficient') else 'chưa đủ bằng chứng'} · "
+                    f"{grade.get('reason', '')} · context {grade.get('evidence_chars', 0):,} ký tự"
+                )
+                for label in grade.get("evidence_sources", []):
+                    st.markdown(f"- Grader đã xem: {label}")
+                if grade.get("error"):
+                    st.warning(f"Context judge bị bỏ qua: {grade['error']}")
+            if diagnostics.get("abstained_after_retrieval"):
+                st.warning("Đã dừng trước bước sinh câu trả lời vì bằng chứng sau một lần tìm lại vẫn chưa đủ.")
         if retrieval:
             st.markdown("**Tìm kiếm và xếp hạng**")
-            if retrieval.get("strategy") == "dense":
+            if retrieval.get("strategy") in {"dense", "dense+exact-section"}:
                 st.caption(
                     f"Dense top-k: {retrieval.get('dense_candidate_count', 0)}/"
                     f"{retrieval.get('top_k', 0)} kết quả · BM25: không chạy · "
@@ -1322,13 +1435,17 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                 )
             dense_top = retrieval.get("dense_top_labels") or _readable_chunk_ids(retrieval.get("dense_top_ids", []))
             if dense_top:
-                st.markdown("**Dense top (câu hỏi gốc)**")
+                st.markdown(
+                    "**Nguồn mục/điều ưu tiên cùng Dense top**"
+                    if retrieval.get("strategy") == "dense+exact-section"
+                    else "**Dense top (câu hỏi gốc)**"
+                )
                 for label in dense_top:
                     st.markdown(f"- {label}")
             else:
                 st.caption("Dense top: không có kết quả.")
             bm25_top = retrieval.get("bm25_top_labels") or _readable_chunk_ids(retrieval.get("bm25_top_ids", []))
-            if retrieval.get("strategy") != "dense" and retrieval.get("hybrid_search"):
+            if retrieval.get("strategy") not in {"dense", "dense+exact-section"} and retrieval.get("hybrid_search"):
                 if bm25_top:
                     st.markdown("**BM25 top (câu hỏi gốc)**")
                     for label in bm25_top:
@@ -1339,6 +1456,18 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                 st.markdown("**Dense gốc được giữ để tránh mất nguồn nền**")
                 for label in retrieval["original_dense_anchor_labels"]:
                     st.markdown(f"- {label}")
+            if retrieval.get("structured_references"):
+                refs = ", ".join(
+                    f"{item['kind']} {item['number']}"
+                    for item in retrieval["structured_references"]
+                )
+                st.markdown(f"**Tham chiếu mục/điều nhận diện được:** {refs}")
+                for label in retrieval.get("reference_context_labels", []):
+                    st.markdown(f"- Tiêu đề/cột liên quan: {label}")
+                for label in retrieval.get("reference_anchor_labels", []):
+                    st.markdown(f"- Khớp trực tiếp: {label}")
+                for label in retrieval.get("reference_continuation_labels", []):
+                    st.markdown(f"- Có thể nối tiếp: {label}")
             if retrieval.get("rrf_top_labels"):
                 st.markdown("**Top sau hợp nhất RRF**")
                 for label in retrieval["rrf_top_labels"]:
@@ -1372,7 +1501,9 @@ def _render_diagnostics(diagnostics: dict, message_key: str) -> None:
                 f"{compression.get('context_chars_after', 0):,} ký tự · "
                 f"~{compression.get('context_tokens_estimated', 0):,} token ngữ cảnh · "
                 f"ngân sách {compression.get('context_token_budget', 0):,} token · "
-                f"{compression.get('dense_anchor_sources', 0)} nguồn Dense gốc được bảo toàn"
+                f"{compression.get('dense_anchor_sources', 0)} nguồn Dense gốc được bảo toàn · "
+                f"{compression.get('reference_anchor_sources', 0)} khớp mục/điều · "
+                f"{compression.get('reference_continuation_sources', 0)} nguồn trang nối tiếp"
             )
             if compression.get("selected_context_labels"):
                 st.markdown("**Nguồn thực sự gửi cho Gemini**")
@@ -1515,23 +1646,31 @@ def _run_basic_answer(
     embedding_rpm: int,
     generation_rpm: int,
     progress,
+    document_ids: list[str] | None = None,
 ) -> dict:
     meter = RequestMeter()
     started = time.perf_counter()
     if progress:
         progress("Đang chạy RAG cơ bản: tìm nguồn liên quan hoặc đọc toàn kho theo phạm vi câu hỏi…")
-    result = answer_question(
-        kb_id,
-        api_key,
-        query,
-        history,
-        mode=mode,
-        top_k=top_k,
-        embedding_rpm=embedding_rpm,
-        generation_rpm=generation_rpm,
-        progress=progress,
-        meter=meter,
-    )
+    with trace_span(
+        "rag.basic_pipeline",
+        {"rag.kb_id": kb_id, "rag.mode": mode, "rag.top_k": top_k},
+    ) as span:
+        result = answer_question(
+            kb_id,
+            api_key,
+            query,
+            history,
+            mode=mode,
+            top_k=top_k,
+            embedding_rpm=embedding_rpm,
+            generation_rpm=generation_rpm,
+            document_ids=document_ids,
+            progress=progress,
+            meter=meter,
+        )
+        if span:
+            span.set_attribute("rag.source_count", len(result.get("sources", [])))
     if progress:
         progress("Đã hoàn tất truy xuất/tổng hợp và tạo câu trả lời.")
     result["diagnostics"] = {
@@ -1548,6 +1687,11 @@ def _run_basic_answer(
         "document_coverage": result.get("document_coverage", {}),
         "request_meter": meter.as_dict(),
         "latency_ms": round((time.perf_counter() - started) * 1000),
+        "answer_validation": (
+            {"passed": True, "scope": "Inventory responses come from SQLite and do not require document citations."}
+            if result.get("mode") == "inventory"
+            else validate_answer_citations(str(result.get("answer", "")), result.get("sources", []))
+        ),
     }
     return result
 
@@ -1575,6 +1719,427 @@ def _new_conversation(kb_id: str) -> str:
     return conversation_id
 
 
+def _chat_menu_choices() -> list[dict[str, str]]:
+    scenario_ui.seed_builtin_scenarios()
+    scenarios = db.list_scenarios()
+    choices = [
+        {
+            "label": f"[{index}] {scenario.get('icon', '🧭')} {scenario['title']}",
+            "value": f"__scenario__:{scenario['id']}",
+        }
+        for index, scenario in enumerate(scenarios, start=1)
+    ]
+    choices.append({"label": f"[{len(choices) + 1}] Hỏi đáp tự do", "value": "__workflow__:free"})
+    return choices
+
+
+def _scenario_step_workflow(run: dict, step_index: int, kb_id: str) -> tuple[str, dict]:
+    scenario = scenario_ui._scenario_map(run)
+    steps = scenario.get("steps", [])
+    step = steps[step_index]
+    required = " · bắt buộc" if step.get("required") else " · có thể bỏ qua"
+    content = (
+        f"**{scenario.get('icon', '🧭')} {scenario.get('title', 'Kịch bản')} · "
+        f"Phần {step_index + 1}/{len(steps)}: {step['label']}{required}**"
+    )
+    if step.get("help"):
+        content += f"\n\n{step['help']}"
+    choices: list[dict[str, str]] = []
+    if step["type"] == "file":
+        content += "\n\nĐính kèm file trong ô chat hoặc chọn tài liệu đã lập chỉ mục bên dưới."
+        if scenario.get("document_mode") in {"selected_documents_and_uploads", "knowledge_base_and_uploads"}:
+            documents = [item for item in db.list_documents(kb_id) if item.get("status") == "Sẵn sàng"]
+            for document in documents[:12]:
+                choices.append({
+                    "label": f"📄 {document['file_name']}",
+                    "value": f"__scenario_doc__:{document['id']}",
+                })
+    elif step["type"] == "select":
+        content += "\n\nChọn một phương án:"
+        choices.extend(
+            {"label": value, "value": f"__scenario_answer__:{choice_index}"}
+            for choice_index, value in enumerate(step["choices"])
+        )
+    elif step["type"] == "multiselect":
+        content += "\n\nNhập một hoặc nhiều lựa chọn, phân cách bằng dấu phẩy: " + ", ".join(step["choices"])
+    if step_index > 0:
+        choices.append({"label": "⬅ Sửa phần trước", "value": "__scenario_back__"})
+    if not step.get("required"):
+        choices.append({"label": "Bỏ qua phần này", "value": "__scenario_skip__"})
+    return content, {
+        "flow": "scenario",
+        "step": "collecting",
+        "run_id": run["id"],
+        "step_index": step_index,
+        "choices": choices,
+    }
+
+
+def _save_chat_menu(conversation_id: str) -> None:
+    db.save_message(
+        conversation_id,
+        "assistant",
+        "Chào bạn! Bạn muốn xử lý việc gì hôm nay?",
+        suggestions=[],
+        diagnostics={
+            "chat_workflow": {"flow": "menu", "step": "choose", "choices": _chat_menu_choices()}
+        },
+    )
+
+
+def _current_chat_workflow(messages: list[dict]) -> dict | None:
+    """Only the newest assistant message controls the active chat flow."""
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            workflow = message.get("diagnostics", {}).get("chat_workflow")
+            return workflow if isinstance(workflow, dict) else None
+    return None
+
+
+def _save_workflow_prompt(
+    conversation_id: str,
+    content: str,
+    workflow: dict,
+    *,
+    suggestions: list[str] | None = None,
+) -> None:
+    db.save_message(
+        conversation_id,
+        "assistant",
+        content,
+        suggestions=suggestions or [],
+        diagnostics={"chat_workflow": workflow},
+    )
+
+
+def _check_scenario_output_template(template: str, answer: str) -> dict[str, Any]:
+    headings = [
+        line.strip().lstrip("#").strip()
+        for line in template.splitlines()
+        if line.strip().startswith("#") and line.strip().lstrip("#").strip()
+    ]
+    missing = [heading for heading in headings if heading.casefold() not in answer.casefold()]
+    return {"passed": not missing, "expected_headings": headings, "missing_headings": missing}
+
+
+def _handle_scenario_turn(
+    conversation_id: str,
+    query: str,
+    user_display: str,
+    uploads: list,
+    run: dict,
+    active_kb_id: str,
+    api_key: str,
+    generation_rpm: int,
+    embedding_rpm: int,
+    chunk_size: int,
+    chunk_overlap: int,
+    chunk_strategy: str,
+    answer_settings: dict,
+) -> None:
+    scenario = scenario_ui._scenario_map(run)
+    steps = scenario.get("steps", [])
+    kb_id = scenario.get("knowledge_base_id") or active_kb_id
+    values = dict(run.get("values", {}))
+    document_ids = list(run.get("document_ids", []))
+
+    def save_prompt(content: str, step_index: int | None = None, *, choices: list[dict] | None = None) -> None:
+        workflow = {
+            "flow": "scenario",
+            "step": "grounded_chat" if run.get("status") == "grounded_chat" else "collecting",
+            "run_id": run["id"],
+            "step_index": step_index if step_index is not None else int(run.get("current_step", 0)),
+            "choices": choices or [],
+        }
+        _save_workflow_prompt(conversation_id, content, workflow)
+
+    def scenario_document_ids(current_values: dict) -> list[str]:
+        ids = list(scenario.get("base_document_ids", []))
+        for item in scenario.get("steps", []):
+            if item["type"] == "file":
+                ids.extend(
+                    str(file_item["document_id"])
+                    for file_item in current_values.get(item["key"], [])
+                    if file_item.get("document_id")
+                )
+        return list(dict.fromkeys(ids))
+
+    def run_scoped_rag(question: str, history: list[dict[str, str]]) -> dict:
+        if answer_settings.get("answer_mode") == "Cơ bản":
+            return _run_basic_answer(
+                kb_id, api_key, question, history,
+                mode="Hỏi đáp chi tiết", top_k=int(answer_settings["top_k"]),
+                embedding_rpm=embedding_rpm, generation_rpm=generation_rpm,
+                progress=None, document_ids=document_ids,
+            )
+        return run_advanced_pipeline(
+            kb_id, api_key, question, history,
+            flags=answer_settings["feature_flags"],
+            top_k=int(answer_settings["top_k"]),
+            candidate_k=int(answer_settings["candidate_k"]),
+            context_token_budget=int(answer_settings["context_token_budget"]),
+            embedding_rpm=embedding_rpm, generation_rpm=generation_rpm,
+            use_langgraph=bool(answer_settings["use_langgraph"]),
+            document_ids=document_ids,
+        )
+
+    def start_artifact_generation() -> None:
+        prompt = scenario_ui._scenario_rag_query(scenario, values)
+        try:
+            if not api_key:
+                raise ValueError("Nhập Gemini API key trong phần Kết nối AI & tùy chọn nâng cao.")
+            with st.spinner("Đã thu thập đủ thông tin. Đang tạo sản phẩm đầu ra…"):
+                if document_ids:
+                    result = run_scoped_rag(prompt, db.get_recent_turns(conversation_id, limit=8))
+                    answer = result["answer"]
+                    sources = result.get("sources", [])
+                    diagnostics = result.get("diagnostics", {})
+                    suggestions = result.get("suggestions", [])
+                else:
+                    answer = scenario_ui.generate_text(
+                        api_key, scenario_ui._scenario_prompt(scenario, values),
+                        rpm_limit=generation_rpm, output_tokens=2600,
+                    )
+                    sources, diagnostics, suggestions = [], {}, []
+            diagnostics["scenario_artifact"] = {
+                "run_id": run["id"],
+                "output_format": scenario.get("output_format", "structured_report"),
+                "template_check": _check_scenario_output_template(
+                    str(scenario.get("output_template", "")), answer
+                ),
+            }
+            diagnostics["chat_workflow"] = {
+                "flow": "scenario", "step": "grounded_chat", "run_id": run["id"],
+                "choices": [
+                    {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                    {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                ],
+            }
+            db.update_scenario_run(
+                run["id"], values, len(steps), status="grounded_chat",
+                result=answer, document_ids=document_ids,
+            )
+            db.save_message(
+                conversation_id, "assistant", answer, sources=sources,
+                suggestions=suggestions, diagnostics=diagnostics,
+            )
+        except Exception as error:
+            db.update_scenario_run(
+                run["id"], values, len(steps), status="ready", document_ids=document_ids,
+            )
+            save_prompt(
+                f"Chưa tạo được sản phẩm đầu ra: {error}",
+                choices=[
+                    {"label": "✨ Thử tạo lại", "value": "__scenario_retry__"},
+                    {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                ],
+            )
+        st.rerun()
+
+    if run.get("status") == "ready":
+        db.save_message(conversation_id, "user", user_display or "Thử tạo lại sản phẩm")
+        start_artifact_generation()
+
+    if run.get("status") == "grounded_chat" and query == "__scenario_edit__":
+        db.save_message(conversation_id, "user", user_display or "Sửa thông tin đầu vào")
+        if steps:
+            target = len(steps) - 1
+            values.pop(steps[target]["key"], None)
+            document_ids = scenario_document_ids(values)
+            db.update_scenario_run(run["id"], values, target, status="in_progress", document_ids=document_ids)
+            run = {**run, "values": values, "document_ids": document_ids, "status": "in_progress", "current_step": target}
+            content, workflow = _scenario_step_workflow(run, target, kb_id)
+            _save_workflow_prompt(conversation_id, "Mình sẽ mở lại phần cuối để bạn chỉnh sửa.\n\n" + content, workflow)
+        else:
+            save_prompt("Kịch bản không có phần nhập để sửa.", choices=[{"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"}])
+        st.rerun()
+
+    if run.get("status") == "grounded_chat":
+        db.save_message(conversation_id, "user", user_display or query)
+        followup_query = (
+            f"Tiếp tục trao đổi về sản phẩm '{scenario.get('title', '')}'. "
+            f"Persona nghiệp vụ: {scenario.get('system_instruction', '')}. "
+            "Trả lời câu hỏi tiếp theo dựa trên cùng tập tài liệu; dẫn nguồn [S#], không suy diễn. "
+            f"Câu hỏi tiếp theo: {query}"
+        )
+        if document_ids:
+            if not api_key:
+                _save_workflow_prompt(
+                    conversation_id,
+                    "Cần Gemini API key để tiếp tục hỏi dựa trên tài liệu của kịch bản.",
+                    {
+                        "flow": "scenario", "step": "grounded_chat", "run_id": run["id"],
+                        "choices": [
+                            {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                            {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                        ],
+                    },
+                )
+                st.rerun()
+            try:
+                result = run_scoped_rag(followup_query, db.get_recent_turns(conversation_id, limit=8))
+            except Exception as error:
+                _save_workflow_prompt(
+                    conversation_id,
+                    f"Chưa trả lời được câu hỏi tiếp theo: {error}",
+                    {
+                        "flow": "scenario", "step": "grounded_chat", "run_id": run["id"],
+                        "choices": [
+                            {"label": "↻ Hỏi lại", "value": query},
+                            {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                            {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                        ],
+                    },
+                )
+                st.rerun()
+            diagnostics = result.get("diagnostics", {})
+            diagnostics["chat_workflow"] = {
+                "flow": "scenario", "step": "grounded_chat", "run_id": run["id"],
+                "choices": [
+                    {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                    {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                ],
+            }
+            db.save_message(
+                conversation_id, "assistant", result["answer"],
+                sources=result.get("sources", []), suggestions=result.get("suggestions", []),
+                diagnostics=diagnostics,
+            )
+        else:
+            try:
+                if not api_key:
+                    raise ValueError("Nhập Gemini API key để tiếp tục trao đổi.")
+                answer = scenario_ui.generate_text(
+                    api_key,
+                    f"Trả lời bằng tiếng Việt, bám sát sản phẩm đầu ra đã tạo và nêu rõ nếu chưa đủ dữ kiện.\n"
+                    f"Sản phẩm trước đó:\n{run.get('result', '')[:12000]}\n\nCâu hỏi: {query}",
+                    rpm_limit=generation_rpm,
+                )
+                save_prompt(answer, choices=[
+                    {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                    {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                ])
+            except Exception as error:
+                save_prompt(
+                    f"Chưa trả lời được câu hỏi tiếp theo: {error}",
+                    choices=[
+                        {"label": "↻ Hỏi lại", "value": query},
+                        {"label": "✏️ Sửa thông tin đầu vào", "value": "__scenario_edit__"},
+                        {"label": "↩ Chọn tác vụ khác", "value": "__workflow__:menu"},
+                    ],
+                )
+        st.rerun()
+
+    step_index = int(run.get("current_step", 0))
+    if step_index >= len(steps):
+        # A completed artifact is a grounded conversation, never a dead end.
+        run["status"] = "grounded_chat"
+        run["current_step"] = len(steps)
+        start_artifact_generation()
+
+    step = steps[step_index]
+    value = query.strip()
+    if value == "__scenario_back__":
+        db.save_message(conversation_id, "user", user_display or "Sửa phần trước")
+        target = max(0, step_index - 1)
+        for later_step in steps[target:]:
+            values.pop(later_step["key"], None)
+        document_ids = scenario_document_ids(values)
+        db.update_scenario_run(run["id"], values, target, status="in_progress", document_ids=document_ids)
+        run = {**run, "values": values, "document_ids": document_ids, "current_step": target}
+        content, workflow = _scenario_step_workflow(run, target, kb_id)
+        _save_workflow_prompt(conversation_id, "Mình đã lùi lại một phần. Các phần phía sau được xóa để tránh dùng dữ liệu cũ.\n\n" + content, workflow)
+        st.rerun()
+
+    if value == "__scenario_skip__":
+        value = ""
+    elif value.startswith("__scenario_answer__:"):
+        try:
+            choice_index = int(value.split(":", 1)[1])
+            value = step["choices"][choice_index]
+            user_display = value
+        except (IndexError, TypeError, ValueError):
+            value = ""
+    elif value.startswith("__scenario_doc__:"):
+        selected_id = value.split(":", 1)[1]
+        selected_doc = db.get_document(selected_id)
+        if not selected_doc or selected_doc.get("knowledge_base_id") != kb_id or selected_doc.get("status") != "Sẵn sàng":
+            value = ""
+        else:
+            user_display = f"📄 {selected_doc['file_name']}"
+            value = [{"document_id": selected_id, "file_name": selected_doc["file_name"]}]
+
+    if step["type"] == "file":
+        if uploads:
+            if len(uploads) > 5:
+                value = ""
+                upload_error = "Tải tối đa 5 file cho một phần kịch bản."
+            else:
+                upload_error = ""
+                value = []
+                for uploaded in uploads:
+                    try:
+                        document_id, _message = ingest_upload(
+                            kb_id, uploaded.name, uploaded.getvalue(), api_key,
+                            chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+                            chunk_strategy=chunk_strategy, embedding_rpm=embedding_rpm,
+                            embedding_batch_size=EMBEDDING_BATCH_SIZE,
+                        )
+                        value.append({"document_id": document_id, "file_name": uploaded.name})
+                        document_ids.append(document_id)
+                    except Exception as error:
+                        upload_error = f"Không nhập được {uploaded.name}: {error}"
+                        break
+            user_display = "📎 " + ", ".join(item.name for item in uploads)
+        elif isinstance(value, list):
+            upload_error = ""
+            document_ids.extend(str(item["document_id"]) for item in value if item.get("document_id"))
+        elif not value and not step.get("required"):
+            upload_error = ""
+        else:
+            upload_error = "Chưa có file. Hãy đính kèm file hoặc chọn tài liệu trong kho."
+    else:
+        upload_error = ""
+
+    if step["type"] != "file" and uploads:
+        value = ""
+        upload_error = "Phần này chưa nhận file đính kèm. Hãy gửi câu trả lời bằng văn bản."
+
+    if step["type"] == "multiselect" and value:
+        selected_values = [item.strip() for item in re.split(r"[,;\n]", value) if item.strip()]
+        invalid_values = [item for item in selected_values if item not in step.get("choices", [])]
+        if invalid_values:
+            value = ""
+            upload_error = "Lựa chọn không hợp lệ: " + ", ".join(invalid_values)
+        else:
+            value = selected_values
+    if step["type"] == "select" and value and value not in step.get("choices", []):
+        value = ""
+        upload_error = "Hãy chọn một phương án trong danh sách."
+    if step["type"] != "file" and user_display.startswith("📎"):
+        value = ""
+    if upload_error or (step.get("required") and (value is None or value == "" or value == [])):
+        db.save_message(conversation_id, "user", user_display or query or "Tiếp tục kịch bản")
+        content, workflow = _scenario_step_workflow(run, step_index, kb_id)
+        error_text = upload_error or "Thông tin này bắt buộc."
+        _save_workflow_prompt(conversation_id, error_text + "\n\n" + content, workflow)
+        st.rerun()
+
+    db.save_message(conversation_id, "user", user_display or query or "Bỏ qua phần không bắt buộc")
+    values[step["key"]] = value
+    next_index = step_index + 1
+    document_ids = list(dict.fromkeys(document_ids))
+    if next_index < len(steps):
+        db.update_scenario_run(run["id"], values, next_index, status="in_progress", document_ids=document_ids)
+        run = {**run, "values": values, "document_ids": document_ids, "current_step": next_index}
+        content, workflow = _scenario_step_workflow(run, next_index, kb_id)
+        _save_workflow_prompt(conversation_id, content, workflow)
+        st.rerun()
+
+    db.update_scenario_run(run["id"], values, len(steps), status="ready", document_ids=document_ids)
+    run = {**run, "values": values, "document_ids": document_ids, "current_step": len(steps), "status": "ready"}
+    start_artifact_generation()
+
 def _conversation_picker_labels(conversations: list[dict]) -> dict[str, str]:
     """Return unique, stable selectbox labels even when titles are duplicated."""
     labels: dict[str, str] = {}
@@ -1592,39 +2157,87 @@ def _conversation_picker_labels(conversations: list[dict]) -> dict[str, str]:
     return labels
 
 
-def _queue_follow_up(query: str, kb_id: str, conversation_id: str) -> None:
+def _document_picker_labels(documents: list[dict]) -> dict[str, str]:
+    """Disambiguate same-named files in a KB while preserving their stored names."""
+    normalized_names = {
+        item["id"]: " ".join(
+            unicodedata.normalize("NFKC", str(item.get("file_name", "")))
+            .casefold()
+            .split()
+        )
+        for item in documents
+    }
+    counts: dict[str, int] = {}
+    for key in normalized_names.values():
+        counts[key] = counts.get(key, 0) + 1
+    labels: dict[str, str] = {}
+    for item in documents:
+        item_id = str(item["id"])
+        name = str(item.get("file_name", "Tài liệu"))
+        if counts[normalized_names[item_id]] <= 1:
+            labels[item_id] = name
+            continue
+        suffix_length = min(6, len(item_id))
+        while suffix_length < len(item_id) and any(
+            other_id != item_id
+            and normalized_names[other_id] == normalized_names[item_id]
+            and other_id.startswith(item_id[:suffix_length])
+            for other_id in normalized_names
+        ):
+            suffix_length = min(suffix_length + 2, len(item_id))
+        labels[item_id] = f"{name} · {item_id[:suffix_length]}"
+    return labels
+
+
+def _set_pending_query_request(
+    query: str, kb_id: str, conversation_id: str, *, display: str | None = None
+) -> None:
     # Keep the exact destination with the prompt; do not infer it from a
     # global picker after Streamlit reruns the page.
     st.session_state["pending_query_request"] = {
         "query": query,
         "kb_id": kb_id,
         "conversation_id": conversation_id,
+        "display": display or query,
     }
+
+
+class _ChatDraftUpload:
+    """Keep a chat attachment available while an audio transcript is edited."""
+
+    def __init__(self, name: str, payload: bytes) -> None:
+        self.name = name
+        self._payload = payload
+
+    def getvalue(self) -> bytes:
+        return self._payload
+
+
+def _queue_follow_up(query: str, kb_id: str, conversation_id: str) -> None:
+    # Used as a button callback, which runs before widgets are instantiated.
+    _set_pending_query_request(query, kb_id, conversation_id)
     st.session_state["active_kb_id"] = kb_id
     st.session_state[f"active-conversation-{kb_id}"] = conversation_id
     st.session_state[f"conversation-picker-{kb_id}"] = conversation_id
 
 
-def _queue_typed_query() -> None:
-    """Pin a typed prompt to the selected conversation before the app reruns."""
-    query = str(st.session_state.get("chat-input", "")).strip()
-    kb_id = st.session_state.get("active_kb_id")
-    if not query or not kb_id:
-        return
-
-    conversation_id = st.session_state.get(
-        f"conversation-picker-{kb_id}"
-    ) or st.session_state.get(f"active-conversation-{kb_id}")
-    if conversation_id:
-        _queue_follow_up(query, kb_id, conversation_id)
+def _queue_workflow_choice(value: str, label: str, kb_id: str, conversation_id: str) -> None:
+    # Callbacks run before the chat-input widget is instantiated.
+    _set_pending_query_request(value, kb_id, conversation_id, display=label)
+    st.session_state["active_kb_id"] = kb_id
+    st.session_state[f"active-conversation-{kb_id}"] = conversation_id
+    st.session_state[f"conversation-picker-{kb_id}"] = conversation_id
 
 
 def _create_kb_callback() -> None:
     name = st.session_state.get("new-kb-name", "").strip()
     if name:
-        kb_id = db.create_knowledge_base(name)
-        st.session_state["active_kb_id"] = kb_id
-        st.session_state["kb-create-error"] = ""
+        try:
+            kb_id = db.create_knowledge_base(name)
+            st.session_state["active_kb_id"] = kb_id
+            st.session_state["kb-create-error"] = ""
+        except ValueError as error:
+            st.session_state["kb-create-error"] = str(error)
     else:
         st.session_state["kb-create-error"] = "Nhập tên kho trước khi tạo."
 
@@ -1656,22 +2269,37 @@ def _apply_rag_preset(preset: str) -> None:
         "adv-compress": True,
         "adv-grade": False,
         "adv-citations": False,
+        "adv-corrective-retrieval": False,
+        "adv-agentic-router": False,
+        "adv-agentic-decomposition": False,
+        "adv-agentic-reflection": False,
         "adv-langgraph": True,
     }
     full = {key: True for key in cheap}
+    if preset == "Agentic demo":
+        for key in ("adv-agentic-router", "adv-agentic-decomposition", "adv-agentic-reflection"):
+            st.session_state[key] = True
+        st.session_state["agentic-demo-router"] = True
+        st.session_state["agentic-demo-decomposition"] = True
+        st.session_state["agentic-demo-reflection"] = True
+        return
     for key, enabled in (cheap if preset == "Tiết kiệm API" else full).items():
         st.session_state[key] = enabled
+    chosen = cheap if preset == "Tiết kiệm API" else full
+    st.session_state["agentic-demo-router"] = chosen["adv-agentic-router"]
+    st.session_state["agentic-demo-decomposition"] = chosen["adv-agentic-decomposition"]
+    st.session_state["agentic-demo-reflection"] = chosen["adv-agentic-reflection"]
 
 
 app_surface = st.radio(
     "Khu vực làm việc",
-    ["💬 Chat", "🧪 Phòng thử nghiệm từng bước"],
+    ["💬 Chat", "⚙️ Thiết lập kịch bản", "🧪 Phòng thử nghiệm từng bước", "📊 RAG Evaluation", "🧭 Agentic Patterns"],
     horizontal=True,
     key="app-surface",
 )
 if app_surface == "💬 Chat":
     st.title("💬 Chat với kho tài liệu")
-    st.caption("Thêm tài liệu vào kho, rồi hỏi đáp bằng ngôn ngữ tự nhiên. Câu trả lời có trích dẫn file và trang.")
+    st.caption("Chọn tác vụ ngay trong cuộc trò chuyện, đính kèm tài liệu hoặc ghi âm câu hỏi. Câu trả lời có trích dẫn file và trang.")
 
 with st.sidebar:
     st.header("📚 Kho tài liệu")
@@ -1680,12 +2308,16 @@ with st.sidebar:
         db.init_db()
         knowledge_bases = db.list_knowledge_bases()
     kb_names = {item["id"]: item["name"] for item in knowledge_bases}
+    kb_display_names = {
+        item["id"]: item.get("display_name", item["name"])
+        for item in knowledge_bases
+    }
     if st.session_state.get("active_kb_id") not in kb_names:
         st.session_state["active_kb_id"] = "default" if "default" in kb_names else next(iter(kb_names))
     kb_id = st.selectbox(
         "Đang chat trong kho",
         options=list(kb_names),
-        format_func=lambda item_id: kb_names[item_id],
+        format_func=lambda item_id: kb_display_names[item_id],
         key="active_kb_id",
     )
 
@@ -1693,7 +2325,7 @@ with st.sidebar:
         st.text_input("Tạo kho mới", placeholder="Ví dụ: Quy trình nhân sự", key="new-kb-name")
         st.form_submit_button("＋ Tạo kho", on_click=_create_kb_callback, use_container_width=True)
     if st.session_state.get("kb-create-error"):
-        st.caption(st.session_state["kb-create-error"])
+        st.error(st.session_state["kb-create-error"])
     if st.session_state.get("kb-delete-success"):
         st.success(st.session_state.pop("kb-delete-success"))
 
@@ -1703,11 +2335,14 @@ with st.sidebar:
             st.text_input("Đổi tên kho", value=selected_kb_name, key=f"rename-kb-name-{kb_id}")
             if st.form_submit_button("Lưu tên kho", use_container_width=True):
                 new_name = st.session_state.get(f"rename-kb-name-{kb_id}", "").strip()
-                if not new_name:
-                    st.error("Tên kho không được để trống.")
-                else:
+                try:
                     db.rename_knowledge_base(kb_id, new_name)
+                    st.session_state.pop(f"kb-rename-error-{kb_id}", None)
                     st.rerun()
+                except ValueError as error:
+                    st.session_state[f"kb-rename-error-{kb_id}"] = str(error)
+        if st.session_state.get(f"kb-rename-error-{kb_id}"):
+            st.error(st.session_state.pop(f"kb-rename-error-{kb_id}"))
         if kb_id == "default":
             st.caption("Kho mặc định luôn được giữ lại để ứng dụng có kho dự phòng.")
         else:
@@ -1832,22 +2467,30 @@ with st.sidebar:
             )
         top_k = st.number_input("Số chunk truy xuất", min_value=2, max_value=15, value=6, step=1, key="top-k")
         st.markdown("**Bật/tắt kỹ thuật nâng cao**")
-        preset_col1, preset_col2 = st.columns(2)
+        preset_col1, preset_col2, preset_col3 = st.columns(3)
         preset_col1.button(
             "⚡ Tiết kiệm API",
             key="rag-preset-low-cost",
             help="Giữ retrieval hybrid, reranker local, parent-child, nén cục bộ và LangGraph; tắt planner/audit gọi Gemini thêm.",
             on_click=_apply_rag_preset,
             args=("Tiết kiệm API",),
-            use_container_width=True,
+            width="stretch",
         )
         preset_col2.button(
             "🧪 Bật mọi kỹ thuật",
             key="rag-preset-full",
-            help="Bật cả planner Multi-query/HyDE/Rewrite và audit grading/citation để trình diễn đầy đủ.",
+            help="Bật planner, audit và Corrective Retrieval; có thể thêm tối đa 2 lượt Gemini cùng một lần retrieval.",
             on_click=_apply_rag_preset,
             args=("Đầy đủ",),
-            use_container_width=True,
+            width="stretch",
+        )
+        preset_col3.button(
+            "🧭 Agentic demo",
+            key="rag-preset-agentic",
+            help="Bật ba pattern agentic có giới hạn; các retrieval options khác giữ nguyên.",
+            on_click=_apply_rag_preset,
+            args=("Agentic demo",),
+            width="stretch",
         )
         feature_flags = {
             "parent_child": st.checkbox("Parent-Child chunking", value=True, key="adv-parent-child"),
@@ -1859,11 +2502,41 @@ with st.sidebar:
             "context_compression": st.checkbox("Nén ngữ cảnh trích xuất", value=True, key="adv-compress"),
             "answer_grading": st.checkbox("Chấm mức độ hỗ trợ của câu trả lời", value=False, key="adv-grade"),
             "citation_verification": st.checkbox("Xác minh trích dẫn", value=False, key="adv-citations"),
+            "corrective_retrieval": st.checkbox(
+                "Tự đánh giá nguồn và tìm lại tối đa 1 lần",
+                value=True,
+                key="adv-corrective-retrieval",
+                help="Thêm 1–2 lượt Gemini để chấm độ đủ của bằng chứng và tạo truy vấn sửa. Nếu vẫn thiếu, app từ chối sinh câu trả lời.",
+            ),
+            "function_call_router": st.checkbox(
+                "Function Calling router",
+                value=False,
+                key="adv-agentic-router",
+                help="Gemini chọn một route trong allowlist; route mặc định theo rule vẫn giữ nguyên khi tắt.",
+            ),
+            "query_decomposition": st.checkbox(
+                "Query decomposition (tối đa 3 câu con)",
+                value=False,
+                key="adv-agentic-decomposition",
+                disabled=answer_mode == "Cơ bản",
+                help="Chỉ phân rã câu hỏi cần ghép nhiều dữ kiện; các câu con được truy xuất cùng batch rồi hợp nhất nguồn.",
+            ),
+            "reflection_loop": st.checkbox(
+                "Reflection · tự kiểm tra và sửa tối đa 1 lần",
+                value=False,
+                key="adv-agentic-reflection",
+                disabled=answer_mode == "Cơ bản",
+                help="Audit câu trả lời và citation; nếu có vấn đề, viết lại một lần từ cùng context rồi audit lại. Nếu vẫn lỗi, không phát hành kết luận.",
+            ),
         }
+        if answer_mode == "Cơ bản":
+            feature_flags["query_decomposition"] = False
+            feature_flags["reflection_loop"] = False
         use_langgraph = st.checkbox("Điều phối bằng LangGraph", value=True, key="adv-langgraph")
         feature_flags["langgraph"] = use_langgraph
         st.caption(
-            "Mặc định tối ưu tốc độ: dùng tìm kiếm hybrid và các bước local; bật planner/audit khi cần chất lượng hoặc demo đầy đủ."
+            "Các pattern agentic là tùy chọn và mặc định tắt. Có thể bật riêng, hoặc dùng Agentic demo để bật cả ba; "
+            "preset Tiết kiệm API tắt các bước gọi Gemini bổ sung."
         )
         settings_a, settings_b = st.columns(2)
         with settings_a:
@@ -1922,23 +2595,50 @@ with st.sidebar:
         )
         st.markdown("[Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)")
         planner_enabled = any(
-            feature_flags[name] for name in ("query_rewrite", "multi_query", "hyde")
+            feature_flags[name] for name in ("query_rewrite", "multi_query", "hyde", "query_decomposition")
         )
-        audit_enabled = feature_flags["answer_grading"] or feature_flags["citation_verification"]
-        advanced_generation_calls = 1 + int(planner_enabled) + int(audit_enabled)
+        audit_enabled = (
+            feature_flags["answer_grading"]
+            or feature_flags["citation_verification"]
+            or feature_flags["reflection_loop"]
+        )
+        corrective_calls = 2 * int(feature_flags["corrective_retrieval"])
+        reflection_calls = 2 * int(feature_flags["reflection_loop"])
+        router_calls = int(feature_flags["function_call_router"])
+        advanced_generation_calls = (
+            1 + int(planner_enabled) + int(audit_enabled) + corrective_calls + reflection_calls + router_calls
+        )
         if answer_mode == "So sánh cơ bản và nâng cao":
             st.info(
-                f"Ước tính trước khi hỏi: khoảng {1 + advanced_generation_calls} generation call "
-                "và tối đa 2 embedding call (một baseline + một batch nâng cao). "
-                "Multi-query/HyDE dùng chung một planner; grading/citation dùng chung một audit."
+                f"Ước tính trước khi hỏi: tối đa khoảng {1 + advanced_generation_calls} generation call "
+                f"và tối đa {2 + int(feature_flags['corrective_retrieval'])} embedding call "
+                "(một baseline + tối đa hai batch nâng cao nếu có corrective retrieval). "
+                "Multi-query/HyDE/decomposition dùng chung một planner; grading/citation dùng chung audit đầu."
             )
         elif answer_mode == "Nâng cao":
             st.caption(
-                f"Ước tính: {advanced_generation_calls} generation call và một batch embedding cho lượt hỏi; "
-                "reranker, BM25 và nén ngữ cảnh chạy local. Preset tiết kiệm tắt planner/audit để giảm thêm tối đa 2 generation call."
+                f"Ước tính tối đa: {advanced_generation_calls} generation call và "
+                f"{1 + int(feature_flags['corrective_retrieval'])} batch embedding cho lượt hỏi; "
+                "reranker, BM25 và nén ngữ cảnh chạy local. Function Calling thêm 1 call; decomposition dùng chung planner/embedding batch; "
+                "Reflection có thể thêm tối đa 2 call để sửa và audit lại."
             )
         if feature_flags["reranker"]:
             st.caption("Reranker đa ngôn ngữ được tải về một lần khi chạy nâng cao lần đầu.")
+        with st.expander("RAG Observability · Phoenix local", expanded=False):
+            if OBSERVABILITY_STATUS.get("enabled"):
+                st.success(
+                    f"Cấu hình trace đã bật · {OBSERVABILITY_STATUS.get('project_name')} · "
+                    f"{OBSERVABILITY_STATUS.get('endpoint')}"
+                )
+            elif OBSERVABILITY_STATUS.get("error"):
+                st.warning(OBSERVABILITY_STATUS["message"])
+                st.caption(OBSERVABILITY_STATUS["error"])
+            else:
+                st.caption(OBSERVABILITY_STATUS["message"])
+            st.caption(
+                "Phoenix thu trace LLM và span retrieval/generation khi được bật; mặc định tracing tắt. "
+                "Gemini vẫn được gọi qua API của Google."
+            )
 
     if "api_key" not in locals():
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1961,7 +2661,7 @@ with st.sidebar:
 if app_surface == "🧪 Phòng thử nghiệm từng bước":
     _render_stepwise_lab(
         kb_id,
-        kb_names.get(kb_id, "Kho tài liệu"),
+        kb_display_names.get(kb_id, "Kho tài liệu"),
         api_key,
         chunk_size=int(chunk_size),
         chunk_overlap=int(chunk_overlap),
@@ -1974,10 +2674,58 @@ if app_surface == "🧪 Phòng thử nghiệm từng bước":
     )
     st.stop()
 
+if app_surface == "📊 RAG Evaluation":
+    render_evaluation_workbench(
+        root_dir=ROOT_DIR,
+        kb_id=kb_id,
+        kb_name=kb_display_names.get(kb_id, "Kho tài liệu"),
+        api_key=api_key,
+        feature_flags=feature_flags if "feature_flags" in locals() else {},
+        top_k=int(top_k),
+        candidate_k=int(candidate_k) if "candidate_k" in locals() else 24,
+        context_token_budget=int(context_token_budget) if "context_token_budget" in locals() else 4000,
+        embedding_rpm=int(embedding_rpm),
+        generation_rpm=int(generation_rpm),
+        use_langgraph=bool(use_langgraph) if "use_langgraph" in locals() else True,
+        basic_runner=_run_basic_answer,
+        advanced_runner=run_advanced_pipeline,
+    )
+    st.stop()
+
+if app_surface == "🧭 Agentic Patterns":
+    render_agentic_demo(
+        root_dir=ROOT_DIR,
+        kb_id=kb_id,
+        kb_name=kb_display_names.get(kb_id, "Kho tài liệu"),
+        api_key=api_key,
+        top_k=int(top_k),
+        candidate_k=int(candidate_k) if "candidate_k" in locals() else 24,
+        context_token_budget=int(context_token_budget) if "context_token_budget" in locals() else 4000,
+        embedding_rpm=int(embedding_rpm),
+        generation_rpm=int(generation_rpm),
+        base_flags=feature_flags if "feature_flags" in locals() else {},
+        advanced_runner=run_advanced_pipeline,
+        basic_runner=_run_basic_answer,
+    )
+    st.stop()
+
+if app_surface == "⚙️ Thiết lập kịch bản":
+    scenario_ui.render_scenarios(api_key, int(generation_rpm))
+    with st.expander("ℹ️ LangChain và LangGraph trong project này"):
+        st.markdown(
+            "**LangChain** cung cấp thành phần để xử lý tài liệu và truy xuất: project dùng "
+            "`RecursiveCharacterTextSplitter` để chia đoạn và adapter Chroma để lưu/tìm vector. "
+            "Phần gọi Gemini hiện dùng SDK `google-genai` trực tiếp.\n\n"
+            "**LangGraph** điều phối pipeline RAG theo các node có trạng thái như lập kế hoạch, "
+            "truy xuất, tạo câu trả lời và kiểm tra. Luồng kịch bản mới kiểm soát các bước nhập liệu "
+            "một cách xác định; khi tạo kết quả, nó có thể dùng nội dung tài liệu được tải lên."
+        )
+    st.stop()
+
 
 toolbar_left, toolbar_right = st.columns([5, 1])
 with toolbar_left:
-    st.markdown(f"#### {kb_names.get(kb_id, 'Kho tài liệu')}")
+    st.markdown(f"#### {kb_display_names.get(kb_id, 'Kho tài liệu')}")
     st.caption(current_conversation["title"])
 with toolbar_right:
     st.button(
@@ -2049,14 +2797,24 @@ elif ready_count == 0:
 
 messages = db.get_messages(conversation_id)
 if not messages:
-    st.markdown("\n")
-    st.markdown("### Bạn muốn tìm gì trong kho tài liệu này?")
-    st.caption("Hãy đặt câu hỏi bên dưới. Ứng dụng sẽ tìm đoạn liên quan và dẫn nguồn để bạn kiểm tra.")
+    _save_chat_menu(conversation_id)
+    st.rerun()
+latest_assistant_id = next(
+    (item.get("id") for item in reversed(messages) if item.get("role") == "assistant"),
+    None,
+)
 
 for message_index, message in enumerate(messages):
     role = message["role"] if message["role"] in {"user", "assistant"} else "assistant"
     with st.chat_message(role):
         st.markdown(message["content"])
+        if message["content"].strip():
+            render_tts_player(
+                message["content"],
+                f"message-{message.get('id', message_index)}",
+                api_key,
+                rpm_limit=int(generation_rpm),
+            )
         if role == "assistant":
             saved_steps = message.get("diagnostics", {}).get("progress_steps", [])
             if saved_steps:
@@ -2066,6 +2824,22 @@ for message_index, message in enumerate(messages):
             _render_sources(message.get("sources", []), f"history-{message_index}")
             _render_diagnostics(message.get("diagnostics", {}), str(message.get("id", message_index)))
             _render_comparison(message.get("comparison", {}), str(message.get("id", message_index)))
+            artifact = message.get("diagnostics", {}).get("scenario_artifact")
+            if artifact:
+                template_check = artifact.get("template_check", {})
+                if template_check and not template_check.get("passed", True):
+                    st.warning(
+                        "Kết quả còn thiếu đề mục trong mẫu: "
+                        + ", ".join(template_check.get("missing_headings", []))
+                    )
+                file_suffix = str(artifact.get("output_format", "report")).replace("_", "-")
+                st.download_button(
+                    "📥 Tải sản phẩm (.md)",
+                    data=message["content"],
+                    file_name=f"san-pham-{str(artifact.get('run_id', 'scenario'))[:8]}-{file_suffix}.md",
+                    mime="text/markdown",
+                    key=f"scenario-artifact-download-{message.get('id', message_index)}",
+                )
             suggestions = message.get("suggestions", [])
             if suggestions:
                 st.caption("Bạn có thể hỏi tiếp:")
@@ -2075,6 +2849,20 @@ for message_index, message in enumerate(messages):
                         key=f"suggestion-{message['id']}-{suggestion_index}",
                         on_click=_queue_follow_up,
                         args=(suggestion, kb_id, conversation_id),
+                        disabled=message.get("id") != latest_assistant_id,
+                    )
+            workflow = message.get("diagnostics", {}).get("chat_workflow", {})
+            choices = workflow.get("choices", []) if isinstance(workflow, dict) else []
+            if choices:
+                st.caption("Chọn một mục để tiếp tục:")
+                for choice_index, choice in enumerate(choices):
+                    st.button(
+                        choice["label"],
+                        key=f"workflow-choice-{message.get('id', message_index)}-{choice_index}",
+                        on_click=_queue_workflow_choice,
+                        args=(choice["value"], choice["label"], kb_id, conversation_id),
+                        use_container_width=True,
+                        disabled=message.get("id") != latest_assistant_id,
                     )
             if message["content"].startswith("Mình chưa hoàn tất được yêu cầu này."):
                 previous_user = next(
@@ -2091,27 +2879,214 @@ for message_index, message in enumerate(messages):
                         key=f"retry-question-{message['id']}",
                         on_click=_queue_follow_up,
                         args=(previous_user["content"], kb_id, conversation_id),
+                        disabled=message.get("id") != latest_assistant_id,
                     )
 
+voice_draft = st.session_state.get("pending-voice-draft")
+pending_draft_text = st.session_state.pop("chat-input-draft-value", None)
+if pending_draft_text is not None:
+    # chat_input supports one-shot prefill through session state, but the key
+    # must be assigned before this run instantiates the widget.
+    st.session_state["chat-input"] = pending_draft_text
+if voice_draft:
+    st.caption("🎙 Bản ghi đã chuyển thành chữ. Kiểm tra hoặc sửa nội dung rồi nhấn Gửi để chạy câu hỏi.")
+    if st.button("Xóa bản nháp ghi âm", key=f"clear-voice-draft-{conversation_id}"):
+        st.session_state.pop("pending-voice-draft", None)
+        st.session_state["chat-input"] = ""
+        st.rerun()
+
 pending_request = st.session_state.pop("pending_query_request", None)
-typed_query = st.chat_input(
-    "Hỏi về nội dung trong kho tài liệu…",
+submission = st.chat_input(
+    "Nhập câu hỏi hoặc ghi âm…",
     key="chat-input",
-    on_submit=_queue_typed_query,
+    max_upload_size=MAX_UPLOAD_MB,
+    accept_audio=True,
+    audio_sample_rate=16000,
+    accept_file="multiple",
+    file_type=sorted(ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS),
 )
-query = pending_request["query"] if pending_request else typed_query
-target_kb_id = pending_request["kb_id"] if pending_request else kb_id
-target_conversation_id = pending_request["conversation_id"] if pending_request else conversation_id
-if query:
+query = pending_request["query"] if pending_request else ""
+user_display = pending_request.get("display", query) if pending_request else ""
+chat_uploads = []
+draft_submission_target = None
+if submission is not None:
+    query = str(submission.text or "").strip()
+    user_display = query
+    chat_uploads = list(submission.files or [])
+    if voice_draft:
+        chat_uploads = [
+            _ChatDraftUpload(item["name"], item["data"])
+            for item in voice_draft.get("files", [])
+        ] + chat_uploads
+        draft_submission_target = voice_draft
+        st.session_state.pop("pending-voice-draft", None)
+    if submission.audio is not None:
+        if not api_key:
+            st.error("Nhập Gemini API key trong phần Kết nối AI & tùy chọn nâng cao để nhận dạng giọng nói.")
+            query = ""
+            chat_uploads = []
+            if draft_submission_target:
+                st.session_state["pending-voice-draft"] = draft_submission_target
+        else:
+            with st.spinner("Đang nhận dạng câu hỏi tiếng Việt…"):
+                try:
+                    transcript = transcribe_vietnamese(
+                        submission.audio, api_key, rpm_limit=int(generation_rpm)
+                    )
+                    query = f"{query}\n\nLời nói: {transcript}".strip() if query else transcript
+                    st.session_state["pending-voice-draft"] = {
+                        "text": query,
+                        "files": [
+                            {"name": uploaded.name, "data": uploaded.getvalue()}
+                            for uploaded in chat_uploads
+                        ],
+                        "kb_id": (draft_submission_target or {}).get("kb_id", kb_id),
+                        "conversation_id": (draft_submission_target or {}).get("conversation_id", conversation_id),
+                    }
+                    st.session_state["chat-input-draft-value"] = query
+                    st.rerun()
+                except Exception as error:
+                    st.error(str(error))
+                    query = ""
+                    chat_uploads = []
+                    if draft_submission_target:
+                        st.session_state["pending-voice-draft"] = draft_submission_target
+if submission is None and voice_draft:
+    chat_uploads = []
+if chat_uploads and not query:
+    names = ", ".join(upload.name for upload in chat_uploads)
+    query = f"Hãy phân tích các tài liệu tôi vừa đính kèm: {names}."
+    user_display = f"📎 Đã gửi tài liệu: {names}"
+elif chat_uploads:
+    user_display = f"{user_display}\n\n📎 Đính kèm: {', '.join(upload.name for upload in chat_uploads)}"
+target_kb_id = (
+    pending_request["kb_id"] if pending_request
+    else draft_submission_target["kb_id"] if draft_submission_target
+    else kb_id
+)
+target_conversation_id = (
+    pending_request["conversation_id"] if pending_request
+    else draft_submission_target["conversation_id"] if draft_submission_target
+    else conversation_id
+)
+if query or chat_uploads:
+    active_workflow = _current_chat_workflow(messages)
+    active_run = db.get_active_scenario_run(target_conversation_id)
+    if not active_run and active_workflow and active_workflow.get("run_id"):
+        # Reattach pre-migration scenario sessions to their chat so they can be
+        # resumed instead of falling back to the old form-only path.
+        legacy_run = db.get_scenario_run(str(active_workflow["run_id"]))
+        if legacy_run:
+            migrated_status = "grounded_chat" if legacy_run.get("status") == "completed" else legacy_run.get("status")
+            db.bind_scenario_run_to_conversation(legacy_run["id"], target_conversation_id, status=migrated_status)
+            active_run = db.get_scenario_run(legacy_run["id"])
+    if query.startswith("__workflow__:"):
+        action = query.split(":", 1)[1]
+        if active_run:
+            db.update_scenario_run(
+                active_run["id"], active_run.get("values", {}), active_run.get("current_step", 0),
+                status="completed", document_ids=active_run.get("document_ids", []),
+            )
+        db.save_message(target_conversation_id, "user", user_display or query)
+        if action == "menu":
+            _save_chat_menu(target_conversation_id)
+        elif action == "free":
+            _save_workflow_prompt(
+                target_conversation_id,
+                "Bạn có thể hỏi tự do về các tài liệu trong kho. Hãy nhập câu hỏi hoặc ghi âm ngay bên dưới.",
+                {"flow": "free", "step": "asking"},
+            )
+        st.rerun()
+    elif query.startswith("__scenario__:"):
+        scenario_id = query.split(":", 1)[1]
+        scenario = next((item for item in db.list_scenarios() if item["id"] == scenario_id), None)
+        db.save_message(target_conversation_id, "user", user_display or "Chọn kịch bản")
+        if scenario:
+            if active_run:
+                db.update_scenario_run(
+                    active_run["id"], active_run.get("values", {}), active_run.get("current_step", 0),
+                    status="completed", document_ids=active_run.get("document_ids", []),
+                )
+            configured_kb = scenario.get("knowledge_base_id")
+            if configured_kb and configured_kb not in kb_names:
+                _save_workflow_prompt(
+                    target_conversation_id,
+                    "Kho tri thức gắn với kịch bản không còn tồn tại. Hãy cập nhật cấu hình kịch bản.",
+                    {"flow": "menu", "step": "choose", "choices": _chat_menu_choices()},
+                )
+                st.rerun()
+            scenario_kb_id = configured_kb or target_kb_id
+            base_document_ids = []
+            if scenario.get("document_mode") == "knowledge_base_and_uploads":
+                base_document_ids = [
+                    item["id"] for item in db.list_documents(scenario_kb_id)
+                    if item.get("status") == "Sẵn sàng"
+                ]
+            scenario = {**scenario, "knowledge_base_id": scenario_kb_id, "base_document_ids": base_document_ids}
+            run_id = db.create_scenario_run(
+                scenario, conversation_id=target_conversation_id, document_ids=base_document_ids
+            )
+            run = db.get_scenario_run(run_id)
+            prompt, workflow = _scenario_step_workflow(run, 0, scenario_kb_id)
+            _save_workflow_prompt(target_conversation_id, prompt, workflow)
+        else:
+            _save_workflow_prompt(
+                target_conversation_id,
+                "Không tìm thấy mẫu kịch bản này. Hãy chọn lại từ menu.",
+                {"flow": "menu", "step": "choose", "choices": _chat_menu_choices()},
+            )
+        st.rerun()
+    elif active_run:
+        _handle_scenario_turn(
+            target_conversation_id,
+            query,
+            user_display,
+            chat_uploads,
+            active_run,
+            target_kb_id,
+            api_key,
+            int(generation_rpm),
+            int(embedding_rpm),
+            int(chunk_size),
+            int(chunk_overlap),
+            "parent_child" if feature_flags.get("parent_child", True) else "regular",
+            {
+                "answer_mode": answer_mode,
+                "feature_flags": feature_flags,
+                "top_k": int(top_k),
+                "candidate_k": int(candidate_k),
+                "context_token_budget": int(context_token_budget),
+                "use_langgraph": bool(use_langgraph),
+            },
+        )
+    router_decision = None
+    router_error = None
+    history = None
+    if feature_flags.get("function_call_router") and api_key and not active_run:
+        history = db.get_recent_turns(target_conversation_id, limit=6)
+        try:
+            router_decision = route_with_function_calling(
+                api_key,
+                query,
+                history,
+                generation_rpm=int(generation_rpm),
+            )
+        except Exception as error:
+            router_error = str(error)[:500]
     inventory_query = is_document_count_question(query)
     inventory_list_query = is_document_list_question(query)
     corpus_query = should_use_all_documents(query, chat_mode)
+    if router_decision:
+        inventory_query = router_decision["route"] == "document_count"
+        inventory_list_query = router_decision["route"] == "document_list"
+        corpus_query = router_decision["route"] == "all_documents"
     local_inventory_query = inventory_query or inventory_list_query
     if not api_key and not local_inventory_query:
         st.error("Mở “Kết nối AI & tùy chọn nâng cao” ở thanh bên và nhập Gemini API key.")
     else:
-        history = db.get_recent_turns(target_conversation_id, limit=6)
-        db.save_message(target_conversation_id, "user", query)
+        if history is None:
+            history = db.get_recent_turns(target_conversation_id, limit=6)
+        db.save_message(target_conversation_id, "user", user_display or query)
         status_box = st.empty()
         progress_bar = st.progress(0.02)
         progress_steps: list[str] = []
@@ -2124,9 +3099,44 @@ if query:
                     del progress_steps[:-100]
             status_box.caption(message)
 
+        uploaded_names: list[str] = []
+        uploaded_ids: list[str] = []
+        if chat_uploads:
+            for file_index, uploaded in enumerate(chat_uploads, start=1):
+                progress(f"Đang đưa tài liệu vào kho ({file_index}/{len(chat_uploads)}): {uploaded.name}")
+                try:
+                    document_id, upload_result = ingest_upload(
+                        target_kb_id,
+                        uploaded.name,
+                        uploaded.getvalue(),
+                        api_key,
+                        chunk_size=int(chunk_size),
+                        chunk_overlap=int(chunk_overlap),
+                        chunk_strategy="parent_child" if feature_flags.get("parent_child", True) else "regular",
+                        embedding_rpm=int(embedding_rpm),
+                        embedding_batch_size=EMBEDDING_BATCH_SIZE,
+                    )
+                    uploaded_names.append(uploaded.name)
+                    uploaded_ids.append(document_id)
+                    progress(upload_result)
+                except Exception as error:
+                    progress_steps.append(f"Không nhập được {uploaded.name}: {str(error)[:300]}")
+
         try:
             comparison_data = {}
-            if local_inventory_query or corpus_query:
+            if router_decision and router_decision.get("route") in {"document_count", "document_list"}:
+                result = _document_inventory_answer(
+                    target_kb_id,
+                    include_names=router_decision["route"] == "document_list",
+                )
+                result["diagnostics"] = {
+                    "pipeline": "Danh mục kho · route bằng Function Calling",
+                    "advanced": False,
+                    "techniques": {},
+                    "request_meter": RequestMeter().as_dict(),
+                    "answer_validation": {"passed": True, "scope": "Inventory response from SQLite."},
+                }
+            elif local_inventory_query or corpus_query:
                 result = _run_basic_answer(
                     target_kb_id,
                     api_key,
@@ -2196,7 +3206,31 @@ if query:
             if comparison_data:
                 progress("Đã chạy xong hai pipeline để so sánh kết quả.")
             diagnostics = result.setdefault("diagnostics", {})
+            if router_decision or router_error:
+                diagnostics["agentic_route"] = {
+                    **(router_decision or {}),
+                    "error": router_error,
+                    "fallback": "regex/default route" if router_error else None,
+                }
+                route_meter = (router_decision or {}).get("meter", {})
+                request_meter = diagnostics.setdefault("request_meter", {})
+                for meter_key in (
+                    "api_calls", "generation_calls", "embedding_calls", "input_tokens", "output_tokens",
+                    "estimated_token_calls",
+                ):
+                    request_meter[meter_key] = int(request_meter.get(meter_key, 0)) + int(route_meter.get(meter_key, 0))
+                request_meter["total_tokens"] = int(request_meter.get("input_tokens", 0)) + int(request_meter.get("output_tokens", 0))
+                request_meter["labels"] = list(route_meter.get("labels", [])) + list(request_meter.get("labels", []))
+            elif feature_flags.get("function_call_router"):
+                diagnostics["agentic_route"] = {
+                    "route": "regex/default",
+                    "label": "Rule-based route",
+                    "error": "Function Calling skipped: no API key or active scenario flow.",
+                    "fallback": "regex/default route",
+                }
             diagnostics["progress_steps"] = list(progress_steps)
+            if active_workflow and active_workflow.get("flow") == "free":
+                diagnostics["chat_workflow"] = {"flow": "free", "step": "asking"}
             db.save_message(
                 target_conversation_id,
                 "assistant",
@@ -2218,6 +3252,7 @@ if query:
                 diagnostics={
                     "pipeline": "Nâng cao" if answer_mode != "Cơ bản" else "RAG cơ bản",
                     "progress_steps": progress_steps[-100:],
+                    **({"chat_workflow": active_workflow} if active_workflow else {}),
                 },
             )
             status_box.error(message)
@@ -2233,13 +3268,14 @@ with st.expander(f"🗂️ Tài liệu trong kho · {len(documents)} file · {to
         stat3.metric("Chunk có vector", total_chunks)
         document_ids = [item["id"] for item in documents]
         doc_names = {item["id"]: item["file_name"] for item in documents}
+        doc_display_names = _document_picker_labels(documents)
         doc_selection_key = f"document-selection-{kb_id}"
         if st.session_state.get(doc_selection_key) not in document_ids:
             st.session_state[doc_selection_key] = document_ids[0]
         selected_doc_id = st.selectbox(
             "Chọn tài liệu",
             document_ids,
-            format_func=lambda item_id: doc_names[item_id],
+            format_func=lambda item_id: doc_display_names[item_id],
             key=doc_selection_key,
         )
         selected_doc = next(item for item in documents if item["id"] == selected_doc_id)

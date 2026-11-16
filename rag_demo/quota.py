@@ -82,6 +82,24 @@ class RequestMeter:
         if purpose != "embedding":
             if output_count is None:
                 response_text = getattr(response, "text", "") or ""
+                if not response_text:
+                    parts = [
+                        part
+                        for candidate in (getattr(response, "candidates", None) or [])
+                        for part in (candidate.content.parts if candidate.content else [])
+                        if getattr(part, "function_call", None) is not None
+                    ]
+                    response_text = json.dumps(
+                        [
+                            {
+                                "name": part.function_call.name,
+                                "args": part.function_call.args,
+                            }
+                            for part in parts
+                        ],
+                        ensure_ascii=False,
+                        default=str,
+                    )
                 output_count = (
                     len(response_text) + CHARS_PER_ESTIMATED_TOKEN - 1
                 ) // CHARS_PER_ESTIMATED_TOKEN
@@ -458,6 +476,7 @@ def generate_answer_json(
             contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=1600,
+                temperature=0.1,
                 response_mime_type="application/json",
                 response_schema=schema,
                 thinking_config=types.ThinkingConfig(thinking_level="minimal"),

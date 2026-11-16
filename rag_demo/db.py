@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -100,6 +101,39 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS scenario_templates (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                icon TEXT NOT NULL DEFAULT '🧭',
+                description TEXT NOT NULL DEFAULT '',
+                system_instruction TEXT NOT NULL DEFAULT '',
+                knowledge_base_id TEXT,
+                document_mode TEXT NOT NULL DEFAULT 'uploads_only',
+                steps_json TEXT NOT NULL,
+                output_format TEXT NOT NULL DEFAULT 'structured_report',
+                output_template TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 1,
+                is_builtin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scenario_runs (
+                id TEXT PRIMARY KEY,
+                scenario_id TEXT NOT NULL,
+                conversation_id TEXT,
+                scenario_json TEXT NOT NULL,
+                values_json TEXT NOT NULL DEFAULT '{}',
+                document_ids_json TEXT NOT NULL DEFAULT '[]',
+                current_step INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                result TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scenario_runs_updated ON scenario_runs(updated_at DESC);
             """
         )
         chunk_columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)").fetchall()}
@@ -115,6 +149,30 @@ def init_db() -> None:
             db.execute("ALTER TABLE messages ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'")
         if "comparison_json" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN comparison_json TEXT NOT NULL DEFAULT '{}'")
+        scenario_columns = {row["name"] for row in db.execute("PRAGMA table_info(scenario_templates)").fetchall()}
+        scenario_migrations = {
+            "slug": "TEXT NOT NULL DEFAULT ''",
+            "icon": "TEXT NOT NULL DEFAULT '🧭'",
+            "system_instruction": "TEXT NOT NULL DEFAULT ''",
+            "knowledge_base_id": "TEXT",
+            "document_mode": "TEXT NOT NULL DEFAULT 'uploads_only'",
+            "output_format": "TEXT NOT NULL DEFAULT 'structured_report'",
+            "output_template": "TEXT NOT NULL DEFAULT ''",
+            "sort_order": "INTEGER NOT NULL DEFAULT 100",
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "version": "INTEGER NOT NULL DEFAULT 1",
+            "is_builtin": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in scenario_migrations.items():
+            if column not in scenario_columns:
+                db.execute(f"ALTER TABLE scenario_templates ADD COLUMN {column} {definition}")
+        run_columns = {row["name"] for row in db.execute("PRAGMA table_info(scenario_runs)").fetchall()}
+        if "conversation_id" not in run_columns:
+            db.execute("ALTER TABLE scenario_runs ADD COLUMN conversation_id TEXT")
+        if "document_ids_json" not in run_columns:
+            db.execute("ALTER TABLE scenario_runs ADD COLUMN document_ids_json TEXT NOT NULL DEFAULT '[]'")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_scenario_templates_order ON scenario_templates(enabled, sort_order, title)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_scenario_runs_conversation ON scenario_runs(conversation_id, status, updated_at DESC)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_chunk_id)")
         _backfill_parent_chunks(db)
         db.execute(
@@ -197,30 +255,87 @@ def list_knowledge_bases() -> list[dict[str, Any]]:
         rows = db.execute(
             "SELECT id, name, created_at FROM knowledge_bases ORDER BY created_at"
         ).fetchall()
-    return [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    normalized_counts: dict[str, int] = {}
+    for item in items:
+        key = _knowledge_base_name_key(item["name"])
+        normalized_counts[key] = normalized_counts.get(key, 0) + 1
+    for item in items:
+        name_key = _knowledge_base_name_key(item["name"])
+        if normalized_counts[name_key] <= 1:
+            item["display_name"] = item["name"]
+            continue
+        suffix_length = min(6, len(item["id"]))
+        while suffix_length < len(item["id"]) and any(
+            other["id"] != item["id"]
+            and _knowledge_base_name_key(other["name"]) == name_key
+            and other["id"].startswith(item["id"][:suffix_length])
+            for other in items
+        ):
+            suffix_length = min(suffix_length + 2, len(item["id"]))
+        item["display_name"] = f"{item['name']} · {item['id'][:suffix_length]}"
+    return items
+
+
+def _knowledge_base_name_key(name: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(name)).casefold()
+    return " ".join(normalized.split())
+
+
+def _clean_knowledge_base_name(name: str) -> str:
+    cleaned = " ".join(unicodedata.normalize("NFC", str(name)).split())
+    if not cleaned:
+        raise ValueError("Tên kho không được để trống.")
+    if len(cleaned) > 100:
+        raise ValueError("Tên kho không được dài quá 100 ký tự.")
+    return cleaned
+
+
+def _ensure_unique_knowledge_base_name(
+    connection: sqlite3.Connection, name: str, *, exclude_id: str | None = None
+) -> None:
+    for row in connection.execute("SELECT id, name FROM knowledge_bases").fetchall():
+        if row["id"] != exclude_id and _knowledge_base_name_key(row["name"]) == _knowledge_base_name_key(name):
+            raise ValueError(
+                f"Tên kho “{row['name']}” đã tồn tại (mã {row['id'][:6]}). "
+                "Chọn kho hiện có hoặc nhập tên khác."
+            )
 
 
 def create_knowledge_base(name: str) -> str:
+    cleaned = _clean_knowledge_base_name(name)
     kb_id = uuid.uuid4().hex
     with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        _ensure_unique_knowledge_base_name(db, cleaned)
         db.execute(
             "INSERT INTO knowledge_bases(id, name, created_at) VALUES(?, ?, ?)",
-            (kb_id, name.strip(), _now()),
+            (kb_id, cleaned, _now()),
         )
     return kb_id
 
 
 def rename_knowledge_base(kb_id: str, name: str) -> None:
-    cleaned = name.strip()
-    if not cleaned:
-        raise ValueError("Tên kho không được để trống.")
+    cleaned = _clean_knowledge_base_name(name)
     with connect() as db:
-        cursor = db.execute(
-            "UPDATE knowledge_bases SET name = ? WHERE id = ?",
-            (cleaned[:100], kb_id),
-        )
-        if cursor.rowcount == 0:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute(
+            "SELECT name FROM knowledge_bases WHERE id = ?", (kb_id,)
+        ).fetchone()
+        if current is None:
             raise ValueError("Không tìm thấy kho tài liệu.")
+        if _knowledge_base_name_key(current["name"]) == _knowledge_base_name_key(cleaned):
+            if current["name"] != cleaned:
+                db.execute(
+                    "UPDATE knowledge_bases SET name = ? WHERE id = ?",
+                    (cleaned, kb_id),
+                )
+            return
+        _ensure_unique_knowledge_base_name(db, cleaned, exclude_id=kb_id)
+        db.execute(
+            "UPDATE knowledge_bases SET name = ? WHERE id = ?",
+            (cleaned, kb_id),
+        )
 
 
 def delete_knowledge_base_record(kb_id: str) -> None:
@@ -585,3 +700,218 @@ def get_messages(conversation_id: str) -> list[dict[str, Any]]:
 def get_recent_turns(conversation_id: str, limit: int = 6) -> list[dict[str, str]]:
     messages = get_messages(conversation_id)
     return [{"role": row["role"], "content": row["content"]} for row in messages[-limit:]]
+
+
+def create_scenario(
+    title: str,
+    description: str,
+    steps: list[dict[str, Any]],
+    *,
+    scenario_id: str | None = None,
+    slug: str = "",
+    icon: str = "🧭",
+    system_instruction: str = "",
+    knowledge_base_id: str | None = None,
+    document_mode: str = "uploads_only",
+    output_format: str = "structured_report",
+    output_template: str = "",
+    sort_order: int = 100,
+    enabled: bool = True,
+    is_builtin: bool = False,
+) -> str:
+    scenario_id = scenario_id or uuid.uuid4().hex
+    now = _now()
+    with connect() as db:
+        db.execute(
+            """INSERT INTO scenario_templates(
+               id, slug, title, icon, description, system_instruction, knowledge_base_id,
+               document_mode, steps_json, output_format, output_template, sort_order,
+               enabled, version, is_builtin, created_at, updated_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+            (
+                scenario_id, slug.strip(), title.strip(), icon, description.strip(),
+                system_instruction.strip(), knowledge_base_id, document_mode,
+                json.dumps(steps, ensure_ascii=False), output_format,
+                output_template.strip(), int(sort_order), int(enabled), int(is_builtin), now, now,
+            ),
+        )
+    return scenario_id
+
+
+def list_scenarios(*, include_disabled: bool = False) -> list[dict[str, Any]]:
+    with connect() as db:
+        sql = "SELECT * FROM scenario_templates"
+        if not include_disabled:
+            sql += " WHERE enabled = 1"
+        rows = db.execute(sql + " ORDER BY sort_order, title COLLATE NOCASE, id").fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["steps"] = json.loads(item.pop("steps_json") or "[]")
+        result.append(item)
+    return result
+
+
+def update_scenario(
+    scenario_id: str,
+    title: str,
+    description: str,
+    steps: list[dict[str, Any]],
+    *,
+    config: dict[str, Any] | None = None,
+) -> None:
+    config = config or {}
+    with connect() as db:
+        current = db.execute("SELECT * FROM scenario_templates WHERE id = ?", (scenario_id,)).fetchone()
+        if current is None:
+            raise ValueError("Không tìm thấy kịch bản.")
+        current = dict(current)
+        cursor = db.execute(
+            """UPDATE scenario_templates SET slug = ?, title = ?, icon = ?, description = ?,
+               system_instruction = ?, knowledge_base_id = ?, document_mode = ?, steps_json = ?,
+               output_format = ?, output_template = ?, sort_order = ?, enabled = ?,
+               version = version + 1, updated_at = ? WHERE id = ?""",
+            (
+                str(config.get("slug", current["slug"])), title.strip(),
+                str(config.get("icon", current["icon"])), description.strip(),
+                str(config.get("system_instruction", current["system_instruction"])),
+                config.get("knowledge_base_id", current["knowledge_base_id"]),
+                str(config.get("document_mode", current["document_mode"])),
+                json.dumps(steps, ensure_ascii=False),
+                str(config.get("output_format", current["output_format"])),
+                str(config.get("output_template", current["output_template"])),
+                int(config.get("sort_order", current["sort_order"])),
+                int(config.get("enabled", current["enabled"])), _now(), scenario_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("Không tìm thấy kịch bản.")
+
+
+def delete_scenario(scenario_id: str) -> None:
+    with connect() as db:
+        cursor = db.execute("DELETE FROM scenario_templates WHERE id = ?", (scenario_id,))
+        if cursor.rowcount == 0:
+            raise ValueError("Không tìm thấy kịch bản.")
+
+
+def create_scenario_run(
+    scenario: dict[str, Any],
+    *,
+    conversation_id: str | None = None,
+    document_ids: list[str] | None = None,
+) -> str:
+    run_id = uuid.uuid4().hex
+    snapshot = {
+        "id": scenario["id"],
+        "slug": scenario.get("slug", ""),
+        "title": scenario["title"],
+        "icon": scenario.get("icon", "🧭"),
+        "description": scenario.get("description", ""),
+        "system_instruction": scenario.get("system_instruction", ""),
+        "knowledge_base_id": scenario.get("knowledge_base_id"),
+        "document_mode": scenario.get("document_mode", "uploads_only"),
+        "steps": scenario.get("steps", []),
+        "output_format": scenario.get("output_format", "structured_report"),
+        "output_template": scenario.get("output_template", ""),
+        "version": scenario.get("version", 1),
+        "base_document_ids": list(document_ids or []),
+    }
+    now = _now()
+    with connect() as db:
+        db.execute(
+            """INSERT INTO scenario_runs(id, scenario_id, conversation_id, scenario_json,
+               values_json, document_ids_json, current_step, status, result, created_at, updated_at)
+               VALUES(?, ?, ?, ?, '{}', ?, 0, 'in_progress', '', ?, ?)""",
+            (
+                run_id, scenario["id"], conversation_id,
+                json.dumps(snapshot, ensure_ascii=False),
+                json.dumps(document_ids or [], ensure_ascii=False), now, now,
+            ),
+        )
+    return run_id
+
+
+def get_scenario_run(run_id: str | None) -> dict[str, Any] | None:
+    if not run_id:
+        return None
+    with connect() as db:
+        row = db.execute("SELECT * FROM scenario_runs WHERE id = ?", (run_id,)).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["values"] = json.loads(item.pop("values_json") or "{}")
+    item["document_ids"] = json.loads(item.pop("document_ids_json", "[]") or "[]")
+    return item
+
+
+def get_active_scenario_run(conversation_id: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            """SELECT id FROM scenario_runs WHERE conversation_id = ?
+               AND status IN ('in_progress', 'ready', 'grounded_chat')
+               ORDER BY updated_at DESC LIMIT 1""",
+            (conversation_id,),
+        ).fetchone()
+    return get_scenario_run(row["id"]) if row else None
+
+
+def bind_scenario_run_to_conversation(run_id: str, conversation_id: str, *, status: str | None = None) -> None:
+    with connect() as db:
+        if status is None:
+            db.execute(
+                "UPDATE scenario_runs SET conversation_id = ?, updated_at = ? WHERE id = ?",
+                (conversation_id, _now(), run_id),
+            )
+        else:
+            db.execute(
+                "UPDATE scenario_runs SET conversation_id = ?, status = ?, updated_at = ? WHERE id = ?",
+                (conversation_id, status, _now(), run_id),
+            )
+
+
+def list_scenario_runs(limit: int = 20) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM scenario_runs ORDER BY updated_at DESC LIMIT ?",
+            (max(1, min(100, int(limit))),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["values"] = json.loads(item.pop("values_json") or "{}")
+        item["document_ids"] = json.loads(item.pop("document_ids_json", "[]") or "[]")
+        try:
+            scenario = json.loads(item.get("scenario_json") or "{}")
+        except json.JSONDecodeError:
+            scenario = {}
+        item["scenario_title"] = scenario.get("title", "Kịch bản")
+        result.append(item)
+    return result
+
+
+def update_scenario_run(
+    run_id: str,
+    values: dict[str, Any],
+    current_step: int,
+    *,
+    status: str = "in_progress",
+    result: str | None = None,
+    document_ids: list[str] | None = None,
+) -> None:
+    if status not in {"in_progress", "ready", "grounded_chat", "completed", "error"}:
+        raise ValueError("Trạng thái phiên kịch bản không hợp lệ.")
+    with connect() as db:
+        cursor = db.execute(
+            """UPDATE scenario_runs SET values_json = ?, current_step = ?, status = ?,
+               result = COALESCE(?, result), document_ids_json = COALESCE(?, document_ids_json),
+               updated_at = ? WHERE id = ?""",
+            (
+                json.dumps(values, ensure_ascii=False), max(0, int(current_step)), status,
+                result,
+                json.dumps(document_ids, ensure_ascii=False) if document_ids is not None else None,
+                _now(), run_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("Không tìm thấy phiên kịch bản.")

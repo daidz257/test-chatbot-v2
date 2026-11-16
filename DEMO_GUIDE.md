@@ -38,6 +38,14 @@ flowchart LR
 7. **So sánh kỹ thuật** — Trong mục nâng cao chọn **So sánh cơ bản và nâng cao**, hỏi cùng một câu. Dùng **Tiết kiệm API** để trình bày cấu hình ít gọi Gemini, sau đó bật mọi kỹ thuật và hỏi lại. Mở **Xem pipeline, nguồn và chi phí** để chỉ ra query rewrite, nguồn dense/BM25, rerank score, parent, nén, thời gian và token. Mở **So sánh cơ bản và nâng cao** để đối chiếu hai câu trả lời, file/trang/chunk, mức trùng nguồn và chênh lệch API calls/token.
 8. **Giải thích quota** — Chỉ ra embedding được gom theo batch, app tự giãn nhịp và retry 429/503, giữ chunk đã đọc để lập chỉ mục lại sau lỗi quota.
 
+### Demo kịch bản sản phẩm đầu ra
+
+Trong **💬 Chat**, mở menu tác vụ để thấy hai mẫu có sẵn và **Hỏi đáp tự do**. Chọn **Thẩm định Hồ sơ Đấu thầu (Chương III)**, chọn/tải tài liệu, chọn trọng tâm rồi tiếp tục trả lời ngay trong timeline chat. Sau khi nhận báo cáo có trích dẫn, hỏi thêm một câu để minh họa hội thoại vẫn bám cùng tập tài liệu; nút sửa đầu vào mở lại phần cuối của kịch bản.
+
+Mở **⚙️ Thiết lập kịch bản** để tạo một mẫu khác: nhập persona/chỉ dẫn, gắn kho tài liệu nếu cần, thêm/xóa/sắp xếp các bước, đặt trường bắt buộc và viết khung sản phẩm đầu ra. Lưu xong, mẫu xuất hiện trong menu Chat. Mỗi lượt chạy giữ snapshot cấu hình để chỉnh sửa mẫu không làm thay đổi phiên đang chạy. File người dùng tải lên được lập chỉ mục vào kho gắn với kịch bản, nhưng truy xuất của lượt đó chỉ giới hạn ở các tài liệu đã chọn/tải lên.
+
+Trong ô chat, ghi âm sẽ chuyển thành bản nháp văn bản; sửa transcript nếu cần rồi nhấn **Gửi** để chạy. Câu hỏi và câu trả lời đều có nút tạo giọng đọc; sau khi tạo âm thanh, bấm Play trên trình phát.
+
 ### Demo kỹ thuật theo từng bước
 
 Để trình bày chi tiết hơn, chọn **🧪 Phòng thử nghiệm từng bước** ở đầu ứng dụng. Chọn file mẫu, xem preview Chunk thường/Parent-Child rồi chốt một cách chia. Ở từng bước sau, đổi lựa chọn kỹ thuật là chạy và hiện ngay kết quả, còn nút tiếp tục chỉ chốt phương án đang xem. Planner có tám lựa chọn gồm từng kỹ thuật Query Rewrite, Multi-query, HyDE, ba tổ hợp đôi và cả ba; chỉ rõ query được rewrite, query phụ được tạo hoặc câu HyDE. Tiếp đó xem ngay kết quả Vector/Hybrid, thứ tự trước/sau reranker, context có/không nén và kết quả audit. Answer Grading/Citation Verification có lựa chọn riêng lẻ hoặc cùng lúc. Kết quả các bước đã chốt được giữ lại để người xem theo dõi input/output, nguồn, số API calls và token.
@@ -65,6 +73,9 @@ Mỗi tổ hợp planner mới có thể tốn một generation call; nếu quay
 | Trích dẫn sai hoặc câu trả lời yếu | Audit một lần chấm điểm và xác minh nguồn, không tự sửa lặp | Xem điểm, mã trích dẫn chưa hợp lệ và nguồn đã chọn |
 | Kỹ thuật nâng cao khó demo tác động | Chạy baseline và advanced cùng một câu hỏi, lưu hai kết quả | So sánh câu trả lời, nguồn, latency và token |
 | Planner/audit làm tăng request hoặc chạm RPM | Nút Tiết kiệm API tắt planner và audit nhưng vẫn giữ retrieval/rerank/nén local | So sánh API calls/token với cấu hình bật mọi kỹ thuật |
+| Không biết kỹ thuật mới có cải thiện không | Bộ JSONL cố định chạy baseline/advanced cùng câu hỏi, đo source hit/recall, citations, abstention, latency và token | Mở **📊 RAG Evaluation**, chạy vài case rồi tải JSON/CSV |
+| Retrieval sai nhưng câu trả lời vẫn được sinh | Corrective Retrieval chấm đúng context đã chọn để gửi câu trả lời, tìm lại tối đa một lần rồi abstain nếu vẫn thiếu | Bật công tắc trong cài đặt nâng cao và mở diagnostics của lượt hỏi |
+| Khó biết pipeline chậm/lỗi ở node nào | Phoenix local nhận trace LLM và span query planning, retrieval, context, answer, audit, retry | Bật tracing tùy chọn, hỏi lại một case rồi mở UI Phoenix |
 
 ## Chuẩn bị trước buổi trình bày
 
@@ -84,6 +95,7 @@ Mỗi tổ hợp planner mới có thể tốn một generation call; nếu quay
 - Gợi ý câu hỏi và câu trả lời đều do AI sinh; nguồn giúp kiểm chứng nhưng người dùng vẫn nên đối chiếu nội dung quan trọng với file gốc.
 - Giới hạn RPM trong ứng dụng chỉ điều tiết process demo này. Quota thật còn phụ thuộc project, model, tier, tokens, mức sử dụng bên ngoài app và billing.
 - Tìm kiếm cơ bản lấy top-k chunk gần nhất theo cosine distance nhưng chưa có ngưỡng từ chối được hiệu chỉnh; câu hỏi ngoài phạm vi vẫn có thể gửi các đoạn gần nhất cho Gemini. Distance không phải xác suất đúng.
+- Câu hỏi trỏ rõ mục/điều được exact-match heading và ưu tiên kèm tiêu đề bảng/trang tiếp theo để giữ các điều kiện, cột và giá trị khi parser chia nhỏ PDF. Nếu tài liệu lặp số mục trong nhiều mẫu/bảng, mở nguồn để xác định phần áp dụng.
 - Query Rewrite giữ tối đa một lượt hội thoại gần nhất làm ngữ cảnh; câu trả lời và citation vẫn cần dựa vào nguồn của lượt hỏi hiện tại.
 - Nén ngữ cảnh có thể lược thông tin. Khi trình diễn bảng/số liệu, mở phần nguồn để đối chiếu hàng, cột và nội dung gốc.
 
@@ -105,3 +117,21 @@ Chạy thử cùng một bộ câu hỏi ngắn trước buổi demo: một dữ
 | Metadata/lịch sử | SQLite | Kho, file, chunk, hội thoại và trích dẫn |
 | Hybrid/Rerank | BM25 + FlashRank | Hợp nhất từ khóa/vector và xếp lại candidate local |
 | Workflow | LangGraph StateGraph | Điều phối planner → retrieval → compression → answer → audit |
+| Evaluation | Bộ JSONL + phép đo nguồn/citation/abstention | So sánh baseline và advanced, lưu kết quả CSV/JSON; LLM Judge là tùy chọn |
+| Observability | Phoenix + OpenInference + OpenTelemetry | Xem trace provider và span theo bước; mặc định tắt, chạy local |
+
+## Demo task mới: evaluation, trace và agentic loop
+
+Chọn **🧭 Agentic Patterns** để chọn riêng Function Calling router, Query Decomposition và Reflection. Nhấn **So sánh hai workflow** để chạy hai nhánh trên cùng câu hỏi. Cả hai giữ nguyên các retrieval options hiện bật trong thiết lập, bao gồm Corrective Retrieval; baseline tắt ba pattern mới, nhánh thử nghiệm bật lựa chọn của bạn. Màn hình hiển thị pipeline dự kiến và thực tế, route/lý do, câu con, audit trước/sau, nguồn, số lần tìm lại, latency và API/token. Chọn case từ dataset hoặc nhập câu hỏi riêng. Route inventory và tổng hợp toàn kho có pipeline riêng nên các pattern RAG top-k có thể không áp dụng.
+
+Trong cùng màn hình, mở **Routing hiện có trong chatbot** để xem câu hỏi được chuyển sang danh mục SQLite, tổng hợp toàn kho map-reduce, hay RAG top-k. Đây là router theo rule cho một số ý định rõ ràng, không phải model tự chọn tool. Nên dùng một câu hỏi bình thường và một câu tổng hợp toàn kho để demo hai nhánh khác nhau.
+
+Khi so sánh, nêu cả trade-off: evaluator cần thêm một lần gọi Gemini nếu context đủ; nếu chưa đủ có thể thêm một lần đánh giá và một lần embedding/retrieval. Nếu câu trả lời không cải thiện hoặc bằng chứng vốn đã đủ, phần chi phí thêm có thể không đáng. Một case chỉ minh họa cách hoạt động, không chứng minh pattern luôn tốt hơn; dùng **📊 RAG Evaluation** cho nhiều case.
+
+Chọn **📊 RAG Evaluation**, dùng kho có tài liệu khớp expected sources, giữ nhóm case mặc định đại diện hoặc tự chọn case rồi chạy cả RAG cơ bản và nâng cao. Dùng bộ demo 12 câu hỏi hoặc tải JSONL riêng. Chỉ ra một case baseline bỏ sót nguồn, sau đó đối chiếu source recall/MRR, câu trả lời, latency và tokens của advanced. Mở một case để xem nguồn file/trang/chunk và reference answer. Tải JSON để xem manifest model, dataset/corpus hash, cấu hình và case IDs. Bật LLM Judge cho tối đa một case để trình bày cách model chấm correctness/groundedness/relevance; nhấn mạnh điểm judge có thể sai và cần kiểm tra thủ công.
+
+Để demo Function Calling, bật route và chạy các câu đếm file, liệt kê file, hỏi chi tiết, rồi so route model với route rule ở diagnostics. Để demo decomposition, chọn case nhiều nguồn như `cross-document` và xem các câu con cùng chunk được giữ. Để demo Reflection, bật pattern rồi dùng câu trả lời dễ phát sinh claim/citation thiếu; kiểm tra audit, bản sửa và điều kiện abstain. Reflection chỉ sửa một lần trên cùng context; khi thiếu nguồn, bật cả Corrective Retrieval nếu muốn cho thấy nhánh tìm lại riêng.
+
+Function Calling router, decomposition và Reflection mặc định tắt trong Chat. Có thể bật checkbox riêng trong cài đặt nâng cao hoặc dùng preset **Agentic demo**; **Bật mọi kỹ thuật** bật tất cả và có thể tốn quota đáng kể. Corrective Retrieval là tùy chọn nâng cao đã có. Function Calling thêm một generation call; decomposition dùng chung planner và embedding batch; Reflection có thể thêm hai generation call để viết lại và audit lại. Đây là demo pattern có giới hạn, không phải agent tự do hay triển khai đầy đủ CRAG/Self-RAG.
+
+Để demo trace, cài dependency riêng bằng `.\.venv\Scripts\python.exe -m pip install -r .\requirements-observability.txt`, đặt `PHOENIX_TRACING_ENABLED=true` trong `.env`, chạy `run-phoenix.ps1` ở terminal thứ nhất rồi khởi động Streamlit ở terminal thứ hai. Mở `http://localhost:6006` sau khi gửi một câu hỏi. Phoenix giúp xem provider span và node nào tốn thời gian; request Gemini vẫn đi qua API Google.
