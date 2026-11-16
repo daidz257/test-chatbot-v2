@@ -1,7 +1,21 @@
 import unittest
-from rag_demo import db, quota, evaluation, workflow, advanced_rag, agentic_patterns, speech
+from rag_demo import db, quota, evaluation, workflow, advanced_rag, agentic_patterns, speech, scenarios, docx_export
 
 class RegressionTests(unittest.TestCase):
+    def test_cv_screening_scenario_and_docx_export(self):
+        scenarios.seed_builtin_scenarios()
+        all_scenarios = db.list_scenarios(include_disabled=True)
+        cv_sc = next((s for s in all_scenarios if s["id"] == "builtin-cv-screening"), None)
+        self.assertIsNotNone(cv_sc)
+        self.assertEqual(cv_sc["title"], "Sàng lọc CV & Đánh giá phù hợp JD")
+        self.assertGreaterEqual(len(cv_sc["steps"]), 3)
+
+        # Test DOCX export
+        sample_md = "# BÁO CÁO THỬ NGHIỆM\n\n## I. Tổng quan\n- Ứng viên: Nguyễn Trí Đại\n\n| Tiêu chí | Kết quả |\n|---|---|\n| Python | **Đạt** |\n\nKết luận."
+        docx_data = docx_export.markdown_to_docx(sample_md)
+        self.assertIsInstance(docx_data, bytes)
+        self.assertGreater(len(docx_data), 5000)
+        self.assertTrue(docx_data.startswith(b"PK\x03\x04"))  # Standard DOCX zip header
     def test_speech_clean_text_and_fast_tts(self):
         sample = "Theo Chương III: [S1] Tiêu chí hợp đồng tương tự. ```code block``` Báo giá 15 tỷ."
         cleaned = speech.clean_tts_text(sample)

@@ -48,9 +48,28 @@ OUTPUT_PRESETS = {
     "Báo cáo thẩm định": "# BÁO CÁO THẨM ĐỊNH\n\n## I. Tóm tắt\n\n## II. Bảng đối chiếu\n| Tiêu chí | Bằng chứng và trích dẫn | Đánh giá | Ghi chú |\n|---|---|---|---|\n\n## III. Rủi ro và điểm cần làm rõ\n\n## IV. Kết luận và đề xuất",
     "Bảng so sánh": "# BẢNG SO SÁNH\n\n| Hạng mục | Phương án / tài liệu A | Phương án / tài liệu B | Nhận xét | Nguồn |\n|---|---|---|---|---|\n\n## Kết luận",
     "Tóm tắt điều hành": "# TÓM TẮT ĐIỀU HÀNH\n\n## Mục tiêu\n\n## Kết quả chính\n\n## Rủi ro và giả định\n\n## Khuyến nghị tiếp theo",
+    "Đánh giá CV": "# BÁO CÁO ĐÁNH GIÁ VÀ SÀNG LỌC HỒ SƠ ỨNG VIÊN\n\n## I. Thông tin ứng viên & Tổng quan\n\n## II. Bảng đối chiếu yêu cầu tuyển dụng (JD vs CV)\n| Tiêu chí tuyển dụng | Thông tin trong CV & Bằng chứng [S...] | Mức độ đáp ứng (Đạt/Chưa đạt/Cần làm rõ) | Nhận xét chi tiết |\n|---|---|---|---|\n\n## III. Đánh giá chuyên sâu năng lực\n- **Kỹ năng cốt lõi & Công nghệ:**\n- **Kinh nghiệm dự án thực tế:**\n- **Điểm mạnh nổi bật:**\n- **Điểm rủi ro / Lỗ hổng kỹ năng:**\n\n## IV. Kết luận & Đề xuất phỏng vấn\n- **Đánh giá chung:**\n- **Câu hỏi phỏng vấn đề xuất:**",
 }
 
 BUILTIN_SCENARIOS = [
+    {
+        "id": "builtin-cv-screening",
+        "slug": "cv-screening-jd",
+        "title": "Sàng lọc CV & Đánh giá phù hợp JD",
+        "icon": "👤",
+        "description": "Đối chiếu CV ứng viên với bản mô tả công việc (JD), đánh giá kỹ năng, kinh nghiệm và đề xuất câu hỏi phỏng vấn.",
+        "system_instruction": "Bạn là chuyên gia tuyển dụng kỹ thuật (Technical Recruiter). Đối chiếu thận trọng từng tiêu chí trong JD với bằng chứng trong CV; chỉ kết luận khi có bằng chứng rõ ràng trong văn bản. Phân biệt rõ giữa kỹ năng ứng viên tuyên bố với kinh nghiệm dự án thực tế. Đưa ra nhận xét khách quan và đề xuất 3-5 câu hỏi phỏng vấn có tính chuyên môn cao.",
+        "document_mode": "selected_documents_and_uploads",
+        "sort_order": 5,
+        "steps": [
+            {"label": "Hồ sơ ứng viên (CV)", "type": "file", "required": True, "help": "Chọn CV có sẵn trong kho (ví dụ: CV Nguyễn Trí Đại) hoặc tải lên file CV mới.", "choices": []},
+            {"label": "Bản mô tả công việc (JD)", "type": "textarea", "required": True, "help": "Dán yêu cầu tuyển dụng: vị trí, trách nhiệm, kỹ năng bắt buộc và kỹ năng ưu tiên.", "choices": []},
+            {"label": "Tiêu chí đánh giá ưu tiên", "type": "select", "required": True, "help": "Chọn trọng tâm mà bạn muốn hội đồng tuyển dụng thẩm định kỹ nhất.", "choices": ["Toàn diện (Kỹ thuật, Dự án, Tiềm năng phát triển)", "Trọng tâm Kỹ năng chuyên môn & Tech Stack", "Trọng tâm Dự án thực tế & Sản phẩm đã làm", "Đánh giá ứng viên thực tập / Fresher (Nền tảng, khả năng học hỏi)"]},
+            {"label": "Ghi chú thêm cho hội đồng tuyển dụng", "type": "text", "required": False, "help": "Ví dụ: Yêu cầu phỏng vấn bằng tiếng Anh, mức lương dự kiến, v.v.", "choices": []},
+        ],
+        "output_format": "structured_report",
+        "output_template": OUTPUT_PRESETS["Đánh giá CV"],
+    },
     {
         "id": "builtin-tender-check",
         "slug": "tender-check",

@@ -53,6 +53,7 @@ from rag_demo.advanced_rag import run_advanced_pipeline
 from rag_demo.agentic_patterns import route_with_function_calling
 from rag_demo.evaluation_ui import render_evaluation_workbench
 from rag_demo.agentic_demo_ui import render_agentic_demo
+from rag_demo.docx_export import markdown_to_docx
 
 load_dotenv(ROOT_DIR / ".env")
 st.set_page_config(page_title="Chat với kho tài liệu", page_icon="💬", layout="wide")
@@ -2833,13 +2834,32 @@ for message_index, message in enumerate(messages):
                         + ", ".join(template_check.get("missing_headings", []))
                     )
                 file_suffix = str(artifact.get("output_format", "report")).replace("_", "-")
-                st.download_button(
-                    "📥 Tải sản phẩm (.md)",
-                    data=message["content"],
-                    file_name=f"san-pham-{str(artifact.get('run_id', 'scenario'))[:8]}-{file_suffix}.md",
-                    mime="text/markdown",
-                    key=f"scenario-artifact-download-{message.get('id', message_index)}",
-                )
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    st.download_button(
+                        "📥 Tải sản phẩm (.md)",
+                        data=message["content"],
+                        file_name=f"san-pham-{str(artifact.get('run_id', 'scenario'))[:8]}-{file_suffix}.md",
+                        mime="text/markdown",
+                        key=f"scenario-artifact-download-{message.get('id', message_index)}",
+                        use_container_width=True,
+                    )
+                with dl_col2:
+                    try:
+                        docx_bytes = markdown_to_docx(
+                            message["content"],
+                            title=str(artifact.get("title", "Báo cáo kịch bản")),
+                        )
+                        st.download_button(
+                            "📄 Tải sản phẩm (.docx)",
+                            data=docx_bytes,
+                            file_name=f"san-pham-{str(artifact.get('run_id', 'scenario'))[:8]}-{file_suffix}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"scenario-artifact-download-docx-{message.get('id', message_index)}",
+                            use_container_width=True,
+                        )
+                    except Exception as docx_err:
+                        st.caption(f"Không thể xuất file docx: {docx_err}")
             suggestions = message.get("suggestions", [])
             if suggestions:
                 st.caption("Bạn có thể hỏi tiếp:")
