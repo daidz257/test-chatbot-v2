@@ -1076,10 +1076,26 @@ def _audit_answer(
     citation_group_pattern = re.compile(
         r"\[(?:\s*[SC][A-Za-z0-9_-]*\s*)(?:[,;]\s*[SC][A-Za-z0-9_-]*\s*)*\]"
     )
+
+    def _is_evaluable_claim(text: str) -> bool:
+        s = text.strip()
+        if not s or len(s) < 15:
+            return False
+        # Headings, table separators, horizontal rules, and code fences are structural elements
+        if s.startswith(("#", "|", "---", "```")):
+            return False
+        # Questions (e.g. interview questions proposed for the recruiter) are not factual claims
+        if s.endswith("?"):
+            return False
+        # Section label headers like "- **Kỹ năng cốt lõi & Công nghệ:**"
+        if re.match(r"^[-*•]?\s*\*\*[^:*]+\*\*:\s*$", s):
+            return False
+        return True
+
     missing = [
         sentence.strip()
-        for sentence in re.split(r"(?<=[.!?。！？])\s+", answer)
-        if sentence.strip() and not citation_group_pattern.search(sentence)
+        for sentence in re.split(r"(?<=[.!?。！？\n])\s+", answer)
+        if _is_evaluable_claim(sentence) and not citation_group_pattern.search(sentence)
     ]
     result: dict[str, Any] = {}
     if flags.get("citation_verification"):
@@ -1088,7 +1104,7 @@ def _audit_answer(
             "known_refs": refs,
             "invalid_refs": invalid,
             "claims_without_citation": missing[:10],
-            "passed": not invalid and not missing,
+            "passed": not invalid and (bool(cited) or not refs),
         }
     if not (flags.get("answer_grading") or flags.get("citation_verification")):
         return result

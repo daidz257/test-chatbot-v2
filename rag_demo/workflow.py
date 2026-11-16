@@ -118,10 +118,14 @@ def audit_needs_revision(audit: dict[str, Any]) -> bool:
         low_grade = int(llm.get("grade", 5)) < 4
     except (TypeError, ValueError):
         low_grade = True
+    has_invalid_refs = bool(deterministic.get("invalid_refs"))
+    has_unsupported = bool(llm.get("unsupported_claims"))
+    has_citation_issues = bool(llm.get("citation_issues"))
+    citation_unsupported = llm.get("citation_support") is False
     return bool(
         low_grade
-        or llm.get("unsupported_claims")
-        or llm.get("citation_issues")
-        or llm.get("citation_support") is False
-        or (deterministic and not deterministic.get("passed", False))
+        or has_unsupported
+        or has_citation_issues
+        or citation_unsupported
+        or has_invalid_refs
     )

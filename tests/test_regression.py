@@ -124,6 +124,20 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertTrue(workflow.audit_needs_revision(state_reflection["audit"]))
 
+        # Verify a high-scoring audit (5/5) with valid citations passes without triggering revision
+        perfect_audit = {
+            "llm_audit": {"grade": 5, "unsupported_claims": [], "citation_issues": [], "citation_support": True},
+            "deterministic_citation_check": {"invalid_refs": [], "passed": True},
+        }
+        self.assertFalse(workflow.audit_needs_revision(perfect_audit))
+
+        # Verify invalid citation IDs trigger a revision pass
+        invalid_ref_audit = {
+            "llm_audit": {"grade": 5, "unsupported_claims": [], "citation_issues": [], "citation_support": True},
+            "deterministic_citation_check": {"invalid_refs": ["S99"], "passed": False},
+        }
+        self.assertTrue(workflow.audit_needs_revision(invalid_ref_audit))
+
     def test_quota_request_meter_token_estimation(self):
         meter = quota.RequestMeter()
         meter.record_attempt("generation", "test-label")
