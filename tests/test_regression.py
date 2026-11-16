@@ -1,7 +1,19 @@
 import unittest
-from rag_demo import db, quota, evaluation, workflow, advanced_rag, agentic_patterns
+from rag_demo import db, quota, evaluation, workflow, advanced_rag, agentic_patterns, speech
 
 class RegressionTests(unittest.TestCase):
+    def test_speech_clean_text_and_fast_tts(self):
+        sample = "Theo Chương III: [S1] Tiêu chí hợp đồng tương tự. ```code block``` Báo giá 15 tỷ."
+        cleaned = speech.clean_tts_text(sample)
+        self.assertNotIn("```", cleaned)
+        self.assertNotIn("[S1]", cleaned)
+        self.assertIn("ba", cleaned)
+        self.assertIn("15 tỷ", cleaned)
+
+        # Verify TTS generation produces valid audio bytes
+        audio = speech.synthesize_vietnamese("Xin chào bạn.")
+        self.assertIsInstance(audio, bytes)
+        self.assertGreater(len(audio), 1000)
     def test_db_initialization(self):
         db.init_db()
         kbs = db.list_knowledge_bases()

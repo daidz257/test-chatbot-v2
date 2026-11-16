@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
+import urllib.request
 import wave
 from io import BytesIO
 from typing import Any
@@ -57,15 +59,83 @@ def transcribe_vietnamese(audio: Any, api_key: str, *, rpm_limit: int = GENERATI
                 pass
 
 
-def synthesize_vietnamese(text: str, api_key: str, *, rpm_limit: int = GENERATION_RPM_LIMIT) -> bytes:
-    """Create a WAV audio response with Gemini TTS for Streamlit's native player."""
-    clean_text = re.sub(r"```.*?```", "Khối mã.", text, flags=re.DOTALL)
-    clean_text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean_text)
-    clean_text = re.sub(r"[#*_`>|]", " ", clean_text)
-    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+def clean_tts_text(text: str) -> str:
+    """Prepare clean, readable Vietnamese text by removing code blocks, citations, and markdown."""
+    clean = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    clean = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean)
+    clean = re.sub(r"\[S\d+\]", "", clean)
+    clean = re.sub(r"\[C[^\]]+\]", "", clean)
+    clean = re.sub(r"[#*_`>|~]", " ", clean)
+    clean = re.sub(r"\bIII\b", "ba", clean)
+    clean = re.sub(r"\bII\b", "hai", clean)
+    clean = re.sub(r"\bIV\b", "bốn", clean)
+    clean = re.sub(r"\bV\b", "năm", clean)
+    clean = re.sub(r"\bI\b", "một", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def synthesize_vietnamese_fast(text: str) -> bytes:
+    """Fast, zero-quota Vietnamese TTS via standard Python HTTP stream (~1-2s latency)."""
+    clean = clean_tts_text(text)
+    if not clean:
+        raise ValueError("Không có nội dung để đọc.")
+
+    parts: list[str] = []
+    current = ""
+    sentences = re.split(r"([.?!;\n]+)", clean)
+    for i in range(0, len(sentences), 2):
+        s = sentences[i]
+        sep = sentences[i + 1] if i + 1 < len(sentences) else ""
+        chunk = (s + sep).strip()
+        if not chunk:
+            continue
+        if len(current) + len(chunk) + 1 <= 180:
+            current = (current + " " + chunk).strip()
+        else:
+            if current:
+                parts.append(current)
+            if len(chunk) <= 180:
+                current = chunk
+            else:
+                for word in chunk.split():
+                    if len(current) + len(word) + 1 <= 180:
+                        current = (current + " " + word).strip()
+                    else:
+                        if current:
+                            parts.append(current)
+                        current = word
+    if current:
+        parts.append(current)
+
+    # Deliver up to 6 sentences (~1.5 minutes of spoken answer) to maintain rapid response
+    parts = parts[:6]
+    audio_combined = b""
+    for part in parts:
+        url = (
+            "https://translate.google.com/translate_tts?ie=UTF-8&q="
+            + urllib.parse.quote(part)
+            + "&tl=vi&client=tw-ob"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            audio_combined += resp.read()
+
+    if not audio_combined:
+        raise ValueError("Không thể tạo dữ liệu âm thanh nhanh.")
+    return audio_combined
+
+
+def synthesize_vietnamese_gemini(
+    text: str, api_key: str, *, rpm_limit: int = GENERATION_RPM_LIMIT
+) -> bytes:
+    """Fallback WAV audio generator using Gemini TTS."""
+    clean_text = clean_tts_text(text)[:1500]
     if not clean_text:
         raise ValueError("Không có nội dung để đọc.")
-    clean_text = clean_text[:12_000]
 
     prompt = (
         "Đọc nguyên văn nội dung tiếng Việt sau bằng giọng rõ ràng, tự nhiên. "
@@ -104,7 +174,9 @@ def synthesize_vietnamese(text: str, api_key: str, *, rpm_limit: int = GENERATIO
         if pcm is not None:
             break
     if pcm is None:
-        raise GeminiRequestError("Gemini TTS không trả về dữ liệu âm thanh. Kiểm tra model hoặc quyền truy cập API.")
+        raise GeminiRequestError(
+            "Gemini TTS không trả về dữ liệu âm thanh. Kiểm tra model hoặc quyền truy cập API."
+        )
 
     output = BytesIO()
     with wave.open(output, "wb") as wav_file:
@@ -115,25 +187,45 @@ def synthesize_vietnamese(text: str, api_key: str, *, rpm_limit: int = GENERATIO
     return output.getvalue()
 
 
-def render_tts_player(text: str, key: str, api_key: str, *, rpm_limit: int = GENERATION_RPM_LIMIT) -> None:
+def synthesize_vietnamese(
+    text: str, api_key: str | None = None, *, rpm_limit: int = GENERATION_RPM_LIMIT
+) -> bytes:
+    """Synthesize Vietnamese audio with rapid neural stream first, falling back to Gemini TTS."""
+    try:
+        return synthesize_vietnamese_fast(text)
+    except Exception:
+        if api_key:
+            return synthesize_vietnamese_gemini(text, api_key, rpm_limit=rpm_limit)
+        raise
+
+
+def render_tts_player(
+    text: str, key: str, api_key: str | None = None, *, rpm_limit: int = GENERATION_RPM_LIMIT
+) -> None:
+    """Render a one-click audio player with instant generation and autoplay support."""
     cache_key = f"tts-audio-{key}"
     if cache_key not in st.session_state:
-        if not api_key:
-            st.caption("Nhập Gemini API key để tạo audio tiếng Việt.")
         if st.button(
-            "🔊 Tạo giọng đọc",
+            "🔊 Nghe câu trả lời",
             key=f"tts-generate-{key}",
-            disabled=not api_key,
-            help="Tạo audio bằng Gemini TTS; lượt này dùng quota generation.",
+            help="Tạo giọng đọc tiếng Việt siêu tốc (1-2s).",
         ):
-            with st.spinner("Đang tạo audio tiếng Việt…"):
+            with st.spinner("Đang tạo giọng đọc tiếng Việt (~1-2 giây)…"):
                 try:
                     st.session_state[cache_key] = synthesize_vietnamese(
-                        text, api_key, rpm_limit=rpm_limit
+                        text, api_key or None, rpm_limit=rpm_limit
                     )
                     st.rerun()
                 except Exception as error:
                     st.error(f"Chưa tạo được audio: {error}")
+
     audio_bytes = st.session_state.get(cache_key)
     if audio_bytes:
-        st.audio(audio_bytes, format="audio/wav", alt="Audio tiếng Việt đọc câu trả lời")
+        audio_format = "audio/wav" if audio_bytes.startswith(b"RIFF") else "audio/mp3"
+        st.audio(
+            audio_bytes,
+            format=audio_format,
+            autoplay=True,
+            alt="Audio tiếng Việt đọc câu trả lời",
+        )
+        st.caption("▶️ Đang phát giọng đọc tiếng Việt. Nếu trình duyệt chặn tự phát, hãy bấm nút Play (▶️).")
